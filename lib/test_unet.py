@@ -10,9 +10,9 @@ from jaxtorch.core import Module, Context, ParamState, PRNG
 from lib import unet
 from guided_diffusion import unet as old_unet
 
-# diffusion_state_dict = torch.load('256x256_diffusion_uncond.pt')
-
 torch.backends.cudnn.deterministic = True
+
+diffusion_state_dict = torch.load('256x256_diffusion_uncond.pt')
 
 def check(old, new):
     old_np = np.array(old)
@@ -23,7 +23,7 @@ def check(old, new):
     # Pretty loose bounds due to float32 precision. There seem to be
     # some implementation differences resulting in different error
     # bounds betwen jax and torch.
-    assert difference/magnitude < 1e-6, difference/magnitude
+    assert difference/magnitude < 1e-6, (difference, magnitude)
 
 def totorch(x):
     return torch.tensor(np.array(x))
@@ -174,4 +174,99 @@ def test_ResBlock():
 
     new_result = new_module(Context(px, rng.split()), x, emb)
     old_result = old_module(x_torch, emb_torch)
+    check(old_result, new_result)
+
+@torch.no_grad()
+def test_AttentionBlock():
+    rng = PRNG(jax.random.PRNGKey(0))
+
+    C = 64
+    new_module = unet.AttentionBlock(C)
+    old_module = old_unet.AttentionBlock(C)
+    px = ParamState(new_module.labeled_parameters_())
+    px.initialize(rng.split())
+    old_module.load_state_dict(torch_state_dict(new_module, px))
+
+    x = jax.random.normal(key=rng.split(), shape=[1, C, 8, 8])
+    x_torch = totorch(x)
+
+    new_result = new_module(px, x)
+    old_result = old_module(x_torch)
+    check(old_result, new_result)
+
+@torch.no_grad()
+def test_UNetModel():
+    rng = PRNG(jax.random.PRNGKey(0))
+
+    config = dict(
+        image_size=64,
+        num_channels=128,
+        num_res_blocks=2,
+        num_heads=4,
+        num_heads_upsample=-1,
+        num_head_channels=-1,
+        attention_resolutions="16,8",
+        channel_mult="",
+        dropout=0.0,
+        class_cond=False,
+        use_checkpoint=False,
+        use_scale_shift_norm=True,
+        resblock_updown=False,
+        use_fp16=False,
+        use_new_attention_order=False,
+    )
+
+    config.update({
+        'attention_resolutions': '32, 16, 8',
+        'class_cond': False,
+        'diffusion_steps': 1000,
+        'rescale_timesteps': True,
+        'timestep_respacing': '1000',
+        'image_size': 256,
+        'learn_sigma': True,
+        'noise_schedule': 'linear',
+        'num_channels': 256,
+        'num_head_channels': 64,
+        'num_res_blocks': 2,
+        'resblock_updown': True,
+        'use_scale_shift_norm': True,
+    })
+
+    attention_ds = []
+    for res in config['attention_resolutions'].split(","):
+        attention_ds.append(config['image_size'] // int(res))
+
+    args = dict(
+        image_size=config['image_size'],
+        in_channels=3,
+        model_channels=256,
+        out_channels=6,
+        num_res_blocks=2,
+        attention_resolutions=attention_ds,
+        dropout=0.0,
+        channel_mult=(1, 1, 2, 2, 4, 4),
+
+        num_heads=config['num_heads'],
+        num_head_channels=config['num_head_channels'],
+        num_heads_upsample=config['num_heads_upsample'],
+        use_scale_shift_norm=config['use_scale_shift_norm'],
+        resblock_updown=config['resblock_updown'],
+        use_new_attention_order=config['use_new_attention_order']
+    )
+
+    new_module = unet.UNetModel(**args)
+    old_module = old_unet.UNetModel(**args)
+    px = ParamState(new_module.labeled_parameters_())
+    px.initialize(rng.split())
+
+    new_module.load_state_dict(px, {name : par.cpu().numpy() for (name, par) in diffusion_state_dict.items()})
+    old_module.load_state_dict(diffusion_state_dict) #torch_state_dict(new_module, px))
+
+    x = jax.random.normal(key=rng.split(), shape=[1, 3, 32, 32])
+    ts = jnp.array([1])
+    x_torch = totorch(x)
+    ts_torch = totorch(ts)
+
+    new_result = new_module(Context(px, rng.split()), x, ts)
+    old_result = old_module(x_torch, ts_torch)
     check(old_result, new_result)
