@@ -76,10 +76,7 @@ def Normalize(mean, std):
     def forward(image):
         [b, c, h, w] = image.shape
         assert c == 3
-        empirical_mean = image.mean(axis=(0,2,3), keepdims=True)
-        empirical_std = image.std(axis=(0,2,3), keepdims=True)
-        z = (image - empirical_mean)/empirical_std
-        return mean + std * z
+        return (z - mean) / std
     return forward
 
 def norm1(x):
