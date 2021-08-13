@@ -340,6 +340,9 @@ class UNetModel(nn.Module):
         use_scale_shift_norm=False,
         resblock_updown=False,
         use_new_attention_order=False,
+            # ignored
+            use_checkpoint=None,
+            use_fp16=None
     ):
         super().__init__()
 
