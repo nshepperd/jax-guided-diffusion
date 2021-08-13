@@ -45,26 +45,30 @@ def fetch(url_or_path):
     return open(url_or_path, 'rb')
 
 def MakeCutouts(cut_size, cutn, cut_pow=1.):
+    # Cutout sizes must be fixed ahead of time to avoid
+    # jit-compilation issues with variable sized tensors.
     rng = PRNG(jax.random.PRNGKey(0))
     sideX = 256
     sideY = 256
     max_size = min(sideX, sideY)
     min_size = min(sideX, sideY, cut_size)
-    cutout_sizes = [int(jax.random.uniform(rng.split())**cut_pow * (max_size - min_size) + min_size) for _ in range(cutn)]
+    cutout_sizes = [int(jax.random.uniform(rng.split())**cut_pow
+                        * (max_size - min_size) + min_size) for _ in range(cutn)]
     def forward(input, key):
         rng = PRNG(key)
         [b, c, h, w] = input.shape
         sideY, sideX = input.shape[2:4]
         cutouts = []
         for i in range(cutn):
-            # size = int(jax.random.uniform(rng.split())**cut_pow * (max_size - min_size) + min_size)
             size = cutout_sizes[i]
             offsetx = jax.random.randint(rng.split(), [], 0, sideX - size + 1)
             offsety = jax.random.randint(rng.split(), [], 0, sideY - size + 1)
-            cutout = jax.lax.dynamic_slice(input, [0, 0, offsety, offsetx], [b, c, size, size])
-            # cutout = input[:, :, offsety:offsety + size, offsetx:offsetx + size]
+            cutout = jax.lax.dynamic_slice(input,
+                                           [0, 0, offsety, offsetx],
+                                           [b, c, size, size])
             cutout = jax.image.resize(cutout,
-                                      (input.shape[0], input.shape[1], cut_size, cut_size),
+                                      (input.shape[0], input.shape[1],
+                                       cut_size, cut_size),
                                       method='bilinear')
             cutouts.append(cutout)
         return jnp.concatenate(cutouts, axis=0)
@@ -131,10 +135,6 @@ with open('256x256_diffusion_uncond.cbor', 'rb') as fp:
 
 model.load_state_dict(px, jax_state_dict)
 
-# dtype = jnp.bfloat16
-# for par in model.parameters():
-#     px[par] = px[par].astype(dtype)
-
 def exec_model_px(px, x, timesteps, y=None):
     cx = Context(px, jax.random.PRNGKey(0))
     return model(cx, x, timesteps, y)
@@ -178,19 +178,10 @@ rng = PRNG(jax.random.PRNGKey(seed))
 text_embed = prompt
 
 init = None
-# init_mask = None
 # if init_image is not None:
 #     init = Image.open(fetch(init_image)).convert('RGB')
 #     init = init.resize((model_config['image_size'], model_config['image_size']), Image.LANCZOS)
 #     init = TF.to_tensor(init).to(device).unsqueeze(0).mul(2).sub(1)
-
-#     S = model_config['image_size']
-#     init_mask = torch.zeros(S, S, dtype=torch.float32)
-#     init_mask[:, S//2:] = 1
-#     init_mask = init_mask.cuda()
-
-#     with th.no_grad():
-#       init_mask = TF.gaussian_blur(init_mask.reshape(1,S,S), 15, 2).reshape(S,S)
 
 make_cutouts = MakeCutouts(clip_size, cutn)
 
@@ -240,7 +231,8 @@ for i in range(n_batches):
             print()
             for k, image in enumerate(sample['pred_xstart']):
                 filename = f'progress_{i * batch_size + k:05}.png'
-                print(k, type(image).mro())
+                # print(k, type(image).mro())
+                # For some reason this comes out as a numpy array. Huh?
                 image = jnp.array(image)
                 image = image.add(1).div(2).clamp(0, 1)
                 image = jnp.transpose(image, (1, 2, 0))
