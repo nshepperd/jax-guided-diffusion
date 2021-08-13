@@ -1,3 +1,7 @@
+# Based on Katherine Crowson's CLIP guided diffusion notebook
+# (https://colab.research.google.com/drive/12a_Wrfi2_gwwAuN3VvMTwVMz9TfqctNj)
+# including a port of https://github.com/crowsonkb/guided-diffusion to jax.
+
 import math
 import io
 import sys
