@@ -114,11 +114,11 @@ def tv_loss(input):
 model_config = model_and_diffusion_defaults()
 model_config.update({
     'attention_resolutions': '32, 16, 8',
-    'class_cond': False,
+    'class_cond': True,
     'diffusion_steps': 1000,
     'rescale_timesteps': True,
     'timestep_respacing': '1000',
-    'image_size': 256,
+    'image_size': 512,
     'learn_sigma': True,
     'noise_schedule': 'linear',
     'num_channels': 256,
@@ -137,28 +137,28 @@ model_params = ParamState(model.labeled_parameters_())
 model_params.initialize(jax.random.PRNGKey(0))
 
 print('Loading state dict...')
-with open('256x256_diffusion_uncond.cbor', 'rb') as fp:
+# with open('256x256_diffusion_uncond.cbor', 'rb') as fp:
+with open('512x512_diffusion.cbor', 'rb') as fp:
     jax_state_dict = jaxtorch.cbor.load(fp)
 
 model.load_state_dict(model_params, jax_state_dict)
 
 def exec_model(model_params, x, timesteps, y=None):
     cx = Context(model_params, jax.random.PRNGKey(0))
-    return model(cx, x, timesteps, y)
+    return model(cx, x, timesteps, y=y)
 exec_model_jit = functools.partial(jax.jit(exec_model), model_params)
 
-def cond_loss(x, t, text_embed, cur_t, key, model_params, clip_params, clip_guidance_scale, tv_scale, make_cutouts):
+def cond_loss(x, t, y, text_embed, cur_t, key, model_params, clip_params, clip_guidance_scale, tv_scale, make_cutouts):
     n = x.shape[0]
     my_t = jnp.ones([n], dtype=jnp.int32) * cur_t
     out = diffusion.p_mean_variance(functools.partial(exec_model,model_params),
                                     x, my_t, clip_denoised=False,
-                                    model_kwargs={'y': None})
+                                    model_kwargs={'y': y})
     fac = diffusion.sqrt_one_minus_alphas_cumprod[cur_t]
     x_in = out['pred_xstart'] * fac + x * (1 - fac)
     clip_in = normalize(make_cutouts(x_in.add(1).div(2), key))
     image_embeds = emb_image(clip_in, clip_params).reshape([cutn, n, 512])
-    dists = spherical_dist_loss(image_embeds, text_embed.reshape(1,1,512))
-    losses = dists.mean(0)
+    losses = spherical_dist_loss(image_embeds.mean(0), text_embed)
     tv_losses = tv_loss(x_in)
     loss = losses.sum() * clip_guidance_scale + tv_losses.sum() * tv_scale
     return -loss
@@ -184,9 +184,9 @@ title = "clockwork angel of crystal | unreal engine"
 prompt = txt(title)
 batch_size = 1
 clip_guidance_scale = 2000
-tv_scale = 150
+tv_scale = 600
 cutn = 16
-cut_pow = 1.0
+cut_pow = 0.5
 n_batches = 8
 init_image = None
 skip_timesteps = 0
@@ -210,9 +210,9 @@ def run():
 
     make_cutouts = MakeCutouts(clip_size, cutn, cut_pow=cut_pow, img_size=model_config['image_size'])
 
-    def cond_fn(x, t):
+    def cond_fn(x, t, y=None):
         # Triggers recompilation if cutout parameters have changed (cutn or cut_pow).
-        return base_cond_fn(x, jnp.array(t),
+        return base_cond_fn(x, jnp.array(t), y=y,
                             text_embed=text_embed,
                             cur_t=jnp.array(cur_t),
                             key=rng.split(),
@@ -230,11 +230,13 @@ def run():
             (batch_size, 3, model_config['image_size'], model_config['image_size']),
             rng=rng,
             clip_denoised=False,
-            model_kwargs={},
+            model_kwargs={'y': jnp.zeros([batch_size], dtype=jnp.int32)},
             cond_fn=cond_fn,
             progress=tqdm,
             skip_timesteps=skip_timesteps,
             init_image=init,
+            randomize_class=True,
+            num_classes=model.num_classes
         )
 
         for j, sample in enumerate(samples):

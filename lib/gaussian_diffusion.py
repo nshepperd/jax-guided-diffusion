@@ -450,6 +450,8 @@ class GaussianDiffusion:
             progress=None,
             skip_timesteps=0,
             init_image=None,
+            randomize_class=False,
+            num_classes=None
     ):
         """
         Generate samples from the model and yield intermediate samples from
@@ -480,6 +482,11 @@ class GaussianDiffusion:
 
         for i in indices:
             t = jnp.array([i] * shape[0])
+            if randomize_class and 'y' in model_kwargs:
+                model_kwargs['y'] = jax.random.randint(rng.split(),
+                                                       model_kwargs['y'].shape,
+                                                       minval=0,
+                                                       maxval=num_classes)
             out = self.p_sample(
                 model,
                 img,
