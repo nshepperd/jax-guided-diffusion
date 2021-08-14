@@ -44,46 +44,62 @@ def fetch(url_or_path):
         return fd
     return open(url_or_path, 'rb')
 
-def MakeCutouts(cut_size, cutn, cut_pow=1.):
-    # Cutout sizes must be fixed ahead of time to avoid
-    # jit-compilation issues with variable sized tensors.
-    rng = PRNG(jax.random.PRNGKey(0))
-    sideX = 256
-    sideY = 256
-    max_size = min(sideX, sideY)
-    min_size = min(sideX, sideY, cut_size)
-    cutout_sizes = [int(jax.random.uniform(rng.split())**cut_pow
-                        * (max_size - min_size) + min_size) for _ in range(cutn)]
-    def forward(input, key):
-        rng = PRNG(key)
+class MakeCutouts(object):
+    def __init__(self, cut_size, cutn, cut_pow=1., img_size=256):
+        self.cut_size = cut_size
+        self.cutn = cutn
+        self.cut_pow = cut_pow
+        self.img_size = img_size
+
+        # Cutout sizes must be fixed ahead of time to avoid
+        # jit-compilation issues with variable sized tensors.  We
+        # compute them deterministically from the parameters, so that
+        # jit recompilation is only required when the parameters are
+        # changed.
+        rng = PRNG(jax.random.PRNGKey(0))
+        sideX = img_size
+        sideY = img_size
+        max_size = min(sideX, sideY)
+        min_size = min(sideX, sideY, cut_size)
+        self.cutout_sizes = [int(jax.random.uniform(rng.split())**cut_pow
+                                * (max_size - min_size) + min_size) for _ in range(cutn)]
+
+    def key(self):
+        return (self.cut_size,self.cutn,self.cut_pow,self.img_size)
+    def __hash__(self):
+        return hash(self.key())
+    def __eq__(self, other):
+        if type(other) is MakeCutouts:
+            return self.key() == other.key()
+        return NotImplemented
+
+    def __call__(self, input, key):
         [b, c, h, w] = input.shape
-        sideY, sideX = input.shape[2:4]
+        rng = PRNG(key)
         cutouts = []
-        for i in range(cutn):
-            size = cutout_sizes[i]
-            offsetx = jax.random.randint(rng.split(), [], 0, sideX - size + 1)
-            offsety = jax.random.randint(rng.split(), [], 0, sideY - size + 1)
+        for (i, size) in enumerate(self.cutout_sizes):
+            offsetx = jax.random.randint(rng.split(), [], 0, w - size + 1)
+            offsety = jax.random.randint(rng.split(), [], 0, h - size + 1)
             cutout = jax.lax.dynamic_slice(input,
                                            [0, 0, offsety, offsetx],
                                            [b, c, size, size])
             cutout = jax.image.resize(cutout,
                                       (input.shape[0], input.shape[1],
-                                       cut_size, cut_size),
+                                       self.cut_size, self.cut_size),
                                       method='bilinear')
             cutouts.append(cutout)
         return jnp.concatenate(cutouts, axis=0)
-    return forward
+
 
 def Normalize(mean, std):
     mean = jnp.array(mean).reshape(3,1,1)
     std = jnp.array(std).reshape(3,1,1)
     def forward(image):
-        [b, c, h, w] = image.shape
-        assert c == 3
-        return (z - mean) / std
+        return (image - mean) / std
     return forward
 
 def norm1(x):
+    """Normalize to the unit sphere."""
     return x / x.square().sum(axis=-1, keepdims=True).sqrt()
 
 def spherical_dist_loss(x, y):
@@ -126,19 +142,36 @@ model_config.update({
 # Load models
 
 model, diffusion = create_model_and_diffusion(**model_config)
-px = ParamState(model.labeled_parameters_())
-px.initialize(jax.random.PRNGKey(0))
+model_params = ParamState(model.labeled_parameters_())
+model_params.initialize(jax.random.PRNGKey(0))
 
 print('Loading state dict...')
 with open('256x256_diffusion_uncond.cbor', 'rb') as fp:
     jax_state_dict = jaxtorch.cbor.load(fp)
 
-model.load_state_dict(px, jax_state_dict)
+model.load_state_dict(model_params, jax_state_dict)
 
-def exec_model_px(px, x, timesteps, y=None):
-    cx = Context(px, jax.random.PRNGKey(0))
+def exec_model(model_params, x, timesteps, y=None):
+    cx = Context(model_params, jax.random.PRNGKey(0))
     return model(cx, x, timesteps, y)
-exec_model = functools.partial(jax.jit(exec_model_px), px)
+exec_model_jit = functools.partial(jax.jit(exec_model), model_params)
+
+def cond_loss(x, t, cur_t, key, model_params, clip_params, make_cutouts):
+    n = x.shape[0]
+    my_t = jnp.ones([n], dtype=jnp.int32) * cur_t
+    out = diffusion.p_mean_variance(functools.partial(exec_model,model_params),
+                                    x, my_t, clip_denoised=False,
+                                    model_kwargs={'y': None})
+    fac = diffusion.sqrt_one_minus_alphas_cumprod[cur_t]
+    x_in = out['pred_xstart'] * fac + x * (1 - fac)
+    clip_in = normalize(make_cutouts(x_in.add(1).div(2), key))
+    image_embeds = emb_image(clip_in, clip_params).reshape([cutn, n, 512])
+    dists = spherical_dist_loss(image_embeds, text_embed.reshape(1,1,512))
+    losses = dists.mean(0)
+    tv_losses = tv_loss(x_in)
+    loss = losses.sum() * clip_guidance_scale + tv_losses.sum() * tv_scale
+    return -loss
+base_cond_fn = jax.jit(jax.grad(cond_loss), static_argnames='make_cutouts')
 
 print('Loading CLIP model...')
 image_fn, text_fn, jax_params, jax_preprocess = clip_jax.load('ViT-B/32') #, "cpu")
@@ -164,11 +197,11 @@ batch_size = 1
 clip_guidance_scale = 2000
 tv_scale = 150
 cutn = 16
+cut_pow = 1.0
 n_batches = 8
 init_image = None
 skip_timesteps = 0
 seed = 1
-
 
 # Actually do the run
 print('Starting run...')
@@ -183,38 +216,25 @@ init = None
 #     init = init.resize((model_config['image_size'], model_config['image_size']), Image.LANCZOS)
 #     init = TF.to_tensor(init).to(device).unsqueeze(0).mul(2).sub(1)
 
-make_cutouts = MakeCutouts(clip_size, cutn)
-
 cur_t = None
 
-def cond_loss(x, t, cur_t, key, px, clip_params, y=None):
-    n = x.shape[0]
-    my_t = jnp.ones([n], dtype=jnp.int32) * cur_t
-    out = diffusion.p_mean_variance(functools.partial(exec_model_px,px), x, my_t, clip_denoised=False, model_kwargs={'y': y})
-    fac = diffusion.sqrt_one_minus_alphas_cumprod[cur_t]
-    x_in = out['pred_xstart'] * fac + x * (1 - fac)
-    clip_in = normalize(make_cutouts(x_in.add(1).div(2), key))
-    image_embeds = emb_image(clip_in, clip_params).reshape([cutn, n, 512])
-    dists = spherical_dist_loss(image_embeds, text_embed.reshape(1,1,512))
-    losses = dists.mean(0)
-    tv_losses = tv_loss(x_in)
-    loss = losses.sum() * clip_guidance_scale + tv_losses.sum() * tv_scale
-    return -loss
-base_cond_fn = jax.jit(jax.grad(cond_loss))
+make_cutouts = MakeCutouts(clip_size, cutn, cut_pow=cut_pow, img_size=model_config['image_size'])
 
 def cond_fn(x, t):
-    return base_cond_fn(x, jnp.array(t), jnp.array(cur_t), key=rng.split(), px=px, clip_params=jax_params)
-
-if model_config['timestep_respacing'].startswith('ddim'):
-    sample_fn = diffusion.ddim_sample_loop_progressive
-else:
-    sample_fn = diffusion.p_sample_loop_progressive
+    # Triggers recompilation if cutout parameters have changed (cutn or cut_pow).
+    return base_cond_fn(x,
+                        t=jnp.array(t),
+                        cur_t=jnp.array(cur_t),
+                        key=rng.split(),
+                        model_params=model_params,
+                        clip_params=jax_params,
+                        make_cutouts=make_cutouts)
 
 for i in range(n_batches):
     cur_t = diffusion.num_timesteps - skip_timesteps - 1
 
-    samples = sample_fn(
-        exec_model,
+    samples = diffusion.p_sample_loop_progressive(
+        exec_model_jit,
         (batch_size, 3, model_config['image_size'], model_config['image_size']),
         rng=rng,
         clip_denoised=False,
