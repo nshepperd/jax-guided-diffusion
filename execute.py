@@ -56,13 +56,12 @@ class MakeCutouts(object):
         # compute them deterministically from the parameters, so that
         # jit recompilation is only required when the parameters are
         # changed.
-        rng = PRNG(jax.random.PRNGKey(0))
         sideX = img_size
         sideY = img_size
         max_size = min(sideX, sideY)
         min_size = min(sideX, sideY, cut_size)
-        self.cutout_sizes = [int(jax.random.uniform(rng.split())**cut_pow
-                                * (max_size - min_size) + min_size) for _ in range(cutn)]
+        cut_us = jax.random.uniform(jax.random.PRNGKey(0), shape=[cutn])**cut_pow
+        self.cutout_sizes = (min_size + cut_us * (max_size - min_size)).astype(jnp.int32).tolist()
 
     def key(self):
         return (self.cut_size,self.cutn,self.cut_pow,self.img_size)
@@ -156,7 +155,7 @@ def exec_model(model_params, x, timesteps, y=None):
     return model(cx, x, timesteps, y)
 exec_model_jit = functools.partial(jax.jit(exec_model), model_params)
 
-def cond_loss(x, t, cur_t, key, model_params, clip_params, make_cutouts):
+def cond_loss(x, t, text_embed, cur_t, key, model_params, clip_params, clip_guidance_scale, tv_scale, make_cutouts):
     n = x.shape[0]
     my_t = jnp.ones([n], dtype=jnp.int32) * cur_t
     out = diffusion.p_mean_variance(functools.partial(exec_model,model_params),
@@ -174,7 +173,7 @@ def cond_loss(x, t, cur_t, key, model_params, clip_params, make_cutouts):
 base_cond_fn = jax.jit(jax.grad(cond_loss), static_argnames='make_cutouts')
 
 print('Loading CLIP model...')
-image_fn, text_fn, jax_params, jax_preprocess = clip_jax.load('ViT-B/32') #, "cpu")
+image_fn, text_fn, clip_params, _ = clip_jax.load('ViT-B/32') #, "cpu")
 clip_size = 224
 normalize = Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
                       std=[0.26862954, 0.26130258, 0.27577711])
@@ -183,12 +182,10 @@ normalize = Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
 def txt(prompt):
   """Returns normalized embedding."""
   text = clip_jax.tokenize([prompt])
-  text_embed = text_fn(jax_params, text)
+  text_embed = text_fn(clip_params, text)
   return norm1(text_embed.reshape(512))
 
 def emb_image(image, clip_params=None):
-    if clip_params is None:
-        clip_params = jax_params
     return norm1(image_fn(clip_params, image))
 
 title = "clockwork angel of crystal | unreal engine"
@@ -206,69 +203,74 @@ seed = 1
 # Actually do the run
 print('Starting run...')
 
-rng = PRNG(jax.random.PRNGKey(seed))
+def run():
+    rng = PRNG(jax.random.PRNGKey(seed))
 
-text_embed = prompt
+    text_embed = prompt
 
-init = None
-# if init_image is not None:
-#     init = Image.open(fetch(init_image)).convert('RGB')
-#     init = init.resize((model_config['image_size'], model_config['image_size']), Image.LANCZOS)
-#     init = TF.to_tensor(init).to(device).unsqueeze(0).mul(2).sub(1)
+    init = None
+    # if init_image is not None:
+    #     init = Image.open(fetch(init_image)).convert('RGB')
+    #     init = init.resize((model_config['image_size'], model_config['image_size']), Image.LANCZOS)
+    #     init = TF.to_tensor(init).to(device).unsqueeze(0).mul(2).sub(1)
 
-cur_t = None
+    cur_t = None
 
-make_cutouts = MakeCutouts(clip_size, cutn, cut_pow=cut_pow, img_size=model_config['image_size'])
+    make_cutouts = MakeCutouts(clip_size, cutn, cut_pow=cut_pow, img_size=model_config['image_size'])
 
-def cond_fn(x, t):
-    # Triggers recompilation if cutout parameters have changed (cutn or cut_pow).
-    return base_cond_fn(x,
-                        t=jnp.array(t),
-                        cur_t=jnp.array(cur_t),
-                        key=rng.split(),
-                        model_params=model_params,
-                        clip_params=jax_params,
-                        make_cutouts=make_cutouts)
+    def cond_fn(x, t):
+        # Triggers recompilation if cutout parameters have changed (cutn or cut_pow).
+        return base_cond_fn(x, jnp.array(t),
+                            text_embed=text_embed,
+                            cur_t=jnp.array(cur_t),
+                            key=rng.split(),
+                            model_params=model_params,
+                            clip_params=clip_params,
+                            clip_guidance_scale = clip_guidance_scale,
+                            tv_scale = tv_scale,
+                            make_cutouts=make_cutouts)
 
-for i in range(n_batches):
-    cur_t = diffusion.num_timesteps - skip_timesteps - 1
+    for i in range(n_batches):
+        cur_t = diffusion.num_timesteps - skip_timesteps - 1
 
-    samples = diffusion.p_sample_loop_progressive(
-        exec_model_jit,
-        (batch_size, 3, model_config['image_size'], model_config['image_size']),
-        rng=rng,
-        clip_denoised=False,
-        model_kwargs={},
-        cond_fn=cond_fn,
-        progress=tqdm,
-        skip_timesteps=skip_timesteps,
-        init_image=init,
-    )
+        samples = diffusion.p_sample_loop_progressive(
+            exec_model_jit,
+            (batch_size, 3, model_config['image_size'], model_config['image_size']),
+            rng=rng,
+            clip_denoised=False,
+            model_kwargs={},
+            cond_fn=cond_fn,
+            progress=tqdm,
+            skip_timesteps=skip_timesteps,
+            init_image=init,
+        )
 
-    for j, sample in enumerate(samples):
-        cur_t -= 1
-        if j % 100 == 0 or cur_t == -1:
-            print()
-            for k, image in enumerate(sample['pred_xstart']):
-                filename = f'progress_{i * batch_size + k:05}.png'
-                # print(k, type(image).mro())
-                # For some reason this comes out as a numpy array. Huh?
-                image = jnp.array(image)
-                image = image.add(1).div(2).clamp(0, 1)
-                image = jnp.transpose(image, (1, 2, 0))
-                image = (image * 256).clamp(0, 255)
-                image = np.array(image).astype('uint8')
-                image = Image.fromarray(image)
-                image.save(filename)
-                print(f'Wrote {filename}')
+        for j, sample in enumerate(samples):
+            cur_t -= 1
+            if j % 100 == 0 or cur_t == -1:
+                print()
+                for k, image in enumerate(sample['pred_xstart']):
+                    filename = f'progress_{i * batch_size + k:05}.png'
+                    # print(k, type(image).mro())
+                    # For some reason this comes out as a numpy array. Huh?
+                    image = jnp.array(image)
+                    image = image.add(1).div(2).clamp(0, 1)
+                    image = jnp.transpose(image, (1, 2, 0))
+                    image = (image * 256).clamp(0, 255)
+                    image = np.array(image).astype('uint8')
+                    image = Image.fromarray(image)
+                    image.save(filename)
+                    print(f'Wrote {filename}')
 
-    # for k in range(batch_size):
-    #     filename = f'progress_{i * batch_size + k:05}.png'
-    #     timestring = time.strftime('%Y%m%d%H%M%S')
-    #     os.makedirs('samples', exist_ok=True)
-    #     dname = f'samples/{timestring}_{k}_{title}.png'
-    #     with open(filename, 'rb') as fp:
-    #       data = fp.read()
-    #     with open(dname, 'wb') as fp:
-    #       fp.write(data)
-    #     files.download(dname)
+        # for k in range(batch_size):
+        #     filename = f'progress_{i * batch_size + k:05}.png'
+        #     timestring = time.strftime('%Y%m%d%H%M%S')
+        #     os.makedirs('samples', exist_ok=True)
+        #     dname = f'samples/{timestring}_{k}_{title}.png'
+        #     with open(filename, 'rb') as fp:
+        #       data = fp.read()
+        #     with open(dname, 'wb') as fp:
+        #       fp.write(data)
+        #     files.download(dname)
+
+run()
