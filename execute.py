@@ -19,14 +19,6 @@ import jaxtorch
 from jaxtorch import PRNG, Context, ParamState, Module
 from tqdm import tqdm
 
-# from torch import nn
-# from torch.nn import functional as F
-# from torchvision import transforms
-# from torchvision.transforms import functional as TF
-# from tqdm.notebook import tqdm
-# from google.colab import files
-
-
 sys.path.append('./CLIP_JAX')
 import clip_jax
 
