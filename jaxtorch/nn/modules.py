@@ -92,7 +92,7 @@ class Dropout(Module):
         self.rate = p
 
     def forward(self, cx, x):
-        if self.rate == 0.0:
+        if self.rate == 0.0 or getattr(cx, 'mode', None)=='eval':
             return x
         key = cx.rng.split()
         p = jax.random.bernoulli(key, 1.0 - self.rate, shape=x.shape)
