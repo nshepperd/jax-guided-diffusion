@@ -25,7 +25,7 @@ register(
     div = lambda a, b: a / b,
     mul = lambda a, b: a * b,
     arcsin = lambda a: jax.numpy.arcsin(a),
-    clamp = lambda a, minval, maxval: jax.numpy.clip(a, a_min=minval, a_max=maxval),
+    clamp = lambda a, min=None, max=None: jax.numpy.clip(a, a_min=min, a_max=max),
     unsqueeze = lambda arr, axis=0: jax.numpy.expand_dims(arr, axis),
     rearrange = rearrange,
 )
