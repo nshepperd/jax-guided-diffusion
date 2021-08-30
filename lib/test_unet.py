@@ -1,5 +1,5 @@
 import sys
-sys.path = ['.', '../guided-diffusion'] + sys.path
+sys.path = ['.', './guided-diffusion'] + sys.path
 import torch
 import numpy as np
 import jax
@@ -12,7 +12,7 @@ from guided_diffusion import unet as old_unet
 
 torch.backends.cudnn.deterministic = True
 
-diffusion_state_dict = torch.load('256x256_diffusion_uncond.pt', map_location='cpu')
+diffusion_state_dict = torch.load('256x256_diffusion_uncond.pt')
 
 def check(old, new):
     old_np = np.array(old)
@@ -41,13 +41,12 @@ def test_QKVAttentionLegacy():
     T = 2
     new_module = unet.QKVAttentionLegacy(n_heads=H)
     old_module = old_unet.QKVAttentionLegacy(n_heads=H)
-    exec_new_module = jax.vmap(new_module, in_axes=[None, 0])
 
     x = jax.random.normal(key=jax.random.PRNGKey(0), shape=[2, (H * 3 * C), T])
     x_torch = torch.tensor(np.array(x))
     cx = Context(ParamState([]), jax.random.PRNGKey(1))
 
-    new_result = np.array(exec_new_module(cx, x))
+    new_result = np.array(new_module(cx, x))
     old_result = np.array(old_module(x_torch))
     difference = np.abs(new_result - old_result).max()
     assert difference < 1e-6, difference
@@ -59,7 +58,6 @@ def test_Upsample2D():
     C = 4
     new_module = unet.Upsample2D(C, use_conv=True)
     old_module = old_unet.Upsample(C, use_conv=True)
-    exec_new_module = jax.vmap(new_module, in_axes=[None, 0])
 
     px = ParamState(new_module.labeled_parameters_())
     px.initialize(rng.split())
@@ -69,7 +67,7 @@ def test_Upsample2D():
     x = jax.random.normal(key=rng.split(), shape=[1, C, 8, 8])
     x_torch = torch.tensor(np.array(x))
 
-    new_result = exec_new_module(px, x)
+    new_result = new_module(px, x)
     old_result = old_module(x_torch)
     check(old_result, new_result)
 
@@ -81,7 +79,6 @@ def test_Downsample2D():
     C = 4
     new_module = unet.Downsample2D(C, use_conv=True)
     old_module = old_unet.Downsample(C, use_conv=True)
-    exec_new_module = jax.vmap(new_module, in_axes=[None, 0])
 
     px = ParamState(new_module.labeled_parameters_())
     px.initialize(rng.split())
@@ -91,15 +88,14 @@ def test_Downsample2D():
     x = jax.random.normal(key=rng.split(), shape=[1, C, 8, 8])
     x_torch = torch.tensor(np.array(x))
 
-    new_result = exec_new_module(px, x)
+    new_result = new_module(px, x)
     old_result = old_module(x_torch)
     check(old_result, new_result)
 
     new_module = unet.Downsample2D(C, use_conv=False)
     old_module = old_unet.Downsample(C, use_conv=False)
-    exec_new_module = jax.vmap(new_module, in_axes=[None, 0])
 
-    new_result = exec_new_module(ParamState([]), x)
+    new_result = new_module(ParamState([]), x)
     old_result = old_module(x_torch)
     check(old_result, new_result)
 
@@ -111,7 +107,6 @@ def test_ResBlock():
     D = 6
     new_module = unet.ResBlock(C, D, dropout=0.1, use_conv=True)
     old_module = old_unet.ResBlock(C, D, dropout=0.1, use_conv=True)
-    exec_new_module = jax.vmap(new_module, in_axes=[None, 0, 0])
 
     px = ParamState(new_module.labeled_parameters_())
     px.initialize(rng.split())
@@ -123,14 +118,13 @@ def test_ResBlock():
     x_torch = totorch(x)
     emb_torch = totorch(emb)
 
-    new_result = exec_new_module(Context(px, rng.split()), x, emb)
+    new_result = new_module(Context(px, rng.split()), x, emb)
     old_result = old_module(x_torch, emb_torch)
     check(old_result, new_result)
 
     # Upsample
     new_module = unet.ResBlock(C, D, dropout=0.1, use_conv=True, up=True)
     old_module = old_unet.ResBlock(C, D, dropout=0.1, use_conv=True, up=True)
-    exec_new_module = jax.vmap(new_module, in_axes=[None, 0, 0])
 
     px = ParamState(new_module.labeled_parameters_())
     px.initialize(rng.split())
@@ -142,14 +136,13 @@ def test_ResBlock():
     x_torch = totorch(x)
     emb_torch = totorch(emb)
 
-    new_result = exec_new_module(Context(px, rng.split()), x, emb)
+    new_result = new_module(Context(px, rng.split()), x, emb)
     old_result = old_module(x_torch, emb_torch)
     check(old_result, new_result)
 
     # Downsample
     new_module = unet.ResBlock(C, D, dropout=0.1, use_conv=True, down=True)
     old_module = old_unet.ResBlock(C, D, dropout=0.1, use_conv=True, down=True)
-    exec_new_module = jax.vmap(new_module, in_axes=[None, 0, 0])
 
     px = ParamState(new_module.labeled_parameters_())
     px.initialize(rng.split())
@@ -161,14 +154,13 @@ def test_ResBlock():
     x_torch = totorch(x)
     emb_torch = totorch(emb)
 
-    new_result = exec_new_module(Context(px, rng.split()), x, emb)
+    new_result = new_module(Context(px, rng.split()), x, emb)
     old_result = old_module(x_torch, emb_torch)
     check(old_result, new_result)
 
     # Downsample
     new_module = unet.ResBlock(C, D, dropout=0.1, use_conv=True, use_scale_shift_norm=True)
     old_module = old_unet.ResBlock(C, D, dropout=0.1, use_conv=True, use_scale_shift_norm=True)
-    exec_new_module = jax.vmap(new_module, in_axes=[None, 0, 0])
 
     px = ParamState(new_module.labeled_parameters_())
     px.initialize(rng.split())
@@ -180,7 +172,7 @@ def test_ResBlock():
     x_torch = totorch(x)
     emb_torch = totorch(emb)
 
-    new_result = exec_new_module(Context(px, rng.split()), x, emb)
+    new_result = new_module(Context(px, rng.split()), x, emb)
     old_result = old_module(x_torch, emb_torch)
     check(old_result, new_result)
 
@@ -191,7 +183,6 @@ def test_AttentionBlock():
     C = 64
     new_module = unet.AttentionBlock(C)
     old_module = old_unet.AttentionBlock(C)
-    exec_new_module = jax.vmap(new_module, in_axes=[None, 0])
     px = ParamState(new_module.labeled_parameters_())
     px.initialize(rng.split())
     old_module.load_state_dict(torch_state_dict(new_module, px))
@@ -199,7 +190,7 @@ def test_AttentionBlock():
     x = jax.random.normal(key=rng.split(), shape=[1, C, 8, 8])
     x_torch = totorch(x)
 
-    new_result = exec_new_module(px, x)
+    new_result = new_module(px, x)
     old_result = old_module(x_torch)
     check(old_result, new_result)
 
@@ -265,7 +256,6 @@ def test_UNetModel():
 
     new_module = unet.UNetModel(**args)
     old_module = old_unet.UNetModel(**args)
-    exec_new_module = jax.vmap(new_module, in_axes=[None, 0, 0])
     px = ParamState(new_module.labeled_parameters_())
     px.initialize(rng.split())
 
@@ -277,6 +267,6 @@ def test_UNetModel():
     x_torch = totorch(x)
     ts_torch = totorch(ts)
 
-    new_result = exec_new_module(Context(px, rng.split()), x, ts)
+    new_result = new_module(Context(px, rng.split()), x, ts)
     old_result = old_module(x_torch, ts_torch)
     check(old_result, new_result)

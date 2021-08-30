@@ -169,13 +169,12 @@ class SiLU(Module):
         return jax.nn.silu(x)
 
 class GroupNorm(Module):
-    def __init__(self, num_groups, num_channels, eps=1e-05, affine=True, batched=True):
+    def __init__(self, num_groups, num_channels, eps=1e-05, affine=True):
         self.num_groups = num_groups
         self.num_channels = num_channels
         assert self.num_channels % self.num_groups == 0
         self.eps = eps
         self.affine = affine
-        self.batched = batched
         if self.affine:
             self.weight = init.ones(num_channels)
             self.bias = init.zeros(num_channels)
@@ -184,22 +183,13 @@ class GroupNorm(Module):
             self.bias = None
 
     def forward(self, cx, x):
-        if self.batched:
-            B, C, *rest = x.shape
-            assert C == self.num_channels
-            x = x.reshape([B, self.num_groups, C//self.num_groups, *rest])
-            mu = x.mean(axis=tuple(range(2,len(x.shape))), keepdims=True)
-            var = x.var(axis=tuple(range(2,len(x.shape))), keepdims=True)
-            y = (x - mu) / jnp.sqrt(var + self.eps)
-            y = y.reshape([B, C, *rest])
-        else:
-            C, *rest = x.shape
-            assert C == self.num_channels
-            x = x.reshape([self.num_groups, C//self.num_groups, *rest])
-            mu = x.mean(axis=tuple(range(1,len(x.shape))), keepdims=True)
-            var = x.var(axis=tuple(range(1,len(x.shape))), keepdims=True)
-            y = (x - mu) / jnp.sqrt(var + self.eps)
-            y = y.reshape([C, *rest])
+        B, C, *rest = x.shape
+        assert C == self.num_channels
+        x = x.reshape([B, self.num_groups, C//self.num_groups, *rest])
+        mu = x.mean(axis=tuple(range(2,len(x.shape))), keepdims=True)
+        var = x.var(axis=tuple(range(2,len(x.shape))), keepdims=True)
+        y = (x - mu) / jnp.sqrt(var + self.eps)
+        y = y.reshape([B, C, *rest])
         if self.affine:
             broadcast_shape = [self.num_channels] + [1] * len(rest)
             weight = cx[self.weight].reshape(broadcast_shape)
