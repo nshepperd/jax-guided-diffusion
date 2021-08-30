@@ -114,7 +114,7 @@ def tv_loss(input):
 model_config = model_and_diffusion_defaults()
 model_config.update({
     'attention_resolutions': '32, 16, 8',
-    'class_cond': True,
+    'class_cond': False,
     'diffusion_steps': 1000,
     'rescale_timesteps': True,
     'timestep_respacing': '1000',
@@ -138,14 +138,14 @@ model_params.initialize(jax.random.PRNGKey(0))
 
 print('Loading state dict...')
 # with open('256x256_diffusion_uncond.cbor', 'rb') as fp:
-with open('512x512_diffusion.cbor', 'rb') as fp:
+with open('512x512_diffusion_uncond_finetune_008100.cbor', 'rb') as fp:
     jax_state_dict = jaxtorch.cbor.load(fp)
 
 model.load_state_dict(model_params, jax_state_dict)
 
 def exec_model(model_params, x, timesteps, y=None):
     cx = Context(model_params, jax.random.PRNGKey(0))
-    return model(cx, x, timesteps, y=y)
+    return model(cx, x.squeeze(0), timesteps.squeeze(0), y=y).unsqueeze(0)
 exec_model_jit = functools.partial(jax.jit(exec_model), model_params)
 
 def cond_loss(x, t, y, text_embed, cur_t, key, model_params, clip_params, clip_guidance_scale, tv_scale, make_cutouts):
@@ -230,13 +230,13 @@ def run():
             (batch_size, 3, model_config['image_size'], model_config['image_size']),
             rng=rng,
             clip_denoised=False,
-            model_kwargs={'y': jnp.zeros([batch_size], dtype=jnp.int32)},
+            model_kwargs={}, #{'y': jnp.zeros([batch_size], dtype=jnp.int32)},
             cond_fn=cond_fn,
             progress=tqdm,
             skip_timesteps=skip_timesteps,
             init_image=init,
-            randomize_class=True,
-            num_classes=model.num_classes
+            # randomize_class=True,
+            # num_classes=model.num_classes
         )
 
         for j, sample in enumerate(samples):

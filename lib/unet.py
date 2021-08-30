@@ -47,20 +47,20 @@ class QKVAttentionLegacy(Module):
         """
         Apply QKV attention.
 
-        :param qkv: an [N x (H * 3 * C) x T] tensor of Qs, Ks, and Vs.
-        :return: an [N x (H * C) x T] tensor after attention.
+        :param qkv: an [(H * 3 * C) x T] tensor of Qs, Ks, and Vs.
+        :return: an [(H * C) x T] tensor after attention.
         """
-        bs, width, length = qkv.shape
+        width, length = qkv.shape
         assert width % (3 * self.n_heads) == 0
         ch = width // (3 * self.n_heads)
-        q, k, v = qkv.reshape(bs * self.n_heads, ch * 3, length).split(3, axis=1)
+        q, k, v = qkv.reshape(self.n_heads, ch * 3, length).split(3, axis=1)
         scale = 1 / np.sqrt(np.sqrt(ch))
         weight = jnp.einsum(
             "bct,bcs->bts", q * scale, k * scale
         )  # More stable with f16 than dividing afterwards
         weight = jax.nn.softmax(weight, axis=-1)
         a = jnp.einsum("bts,bcs->bct", weight, v)
-        return a.reshape(bs, width//3, length)
+        return a.reshape(width//3, length)
 
 class Upsample2D(Module):
     """
@@ -79,11 +79,11 @@ class Upsample2D(Module):
             self.conv = jaxtorch.nn.Conv2d(self.channels, self.out_channels, 3, padding=1)
 
     def forward(self, cx, x):
-        [b, c, h, w] = x.shape
+        [c, h, w] = x.shape
         assert c == self.channels
-        x = x.reshape([b, c, h, 1, w, 1])
-        x = jnp.broadcast_to(x, [b, c, h, 2, w, 2])
-        x = x.reshape([b, c, h*2, w*2])
+        x = x.reshape([c, h, 1, w, 1])
+        x = jnp.broadcast_to(x, [c, h, 2, w, 2])
+        x = x.reshape([c, h*2, w*2])
         if self.use_conv:
             x = self.conv(cx, x)
         return x
@@ -109,13 +109,13 @@ class Downsample2D(Module):
             assert self.channels == self.out_channels
 
     def forward(self, cx, x):
-        assert x.shape[1] == self.channels
+        assert x.shape[0] == self.channels
         if self.use_conv:
             return self.op(cx, x)
         else:
-            [b, c, h, w] = x.shape
-            x = x.reshape(b, c, h//2, 2, w//2, 2)
-            x = x.mean(axis=(3, 5))
+            [c, h, w] = x.shape
+            x = x.reshape(c, h//2, 2, w//2, 2)
+            x = x.mean(axis=(2, 4))
             return x
 
 def normalization(channels):
@@ -125,7 +125,7 @@ def normalization(channels):
     :param channels: number of input channels.
     :return: an nn.Module for normalization.
     """
-    return nn.GroupNorm(32, channels)
+    return nn.GroupNorm(32, channels, batched=False)
 
 class ResBlock(TimestepBlock):
     """
@@ -220,7 +220,7 @@ class ResBlock(TimestepBlock):
             emb_out = emb_out[..., None]
         if self.use_scale_shift_norm:
             out_norm, out_rest = self.out_layers.modules[0], nn.Sequential(*self.out_layers.modules[1:])
-            scale, shift = jnp.split(emb_out, 2, axis=1)
+            scale, shift = jnp.split(emb_out, 2, axis=0)
             h = out_norm(cx, h) * (1 + scale) + shift
             h = out_rest(cx, h)
         else:
@@ -264,31 +264,32 @@ class AttentionBlock(nn.Module):
         self.proj_out = nn.Conv1d(channels, channels, 1, zero_init=True)
 
     def forward(self, cx, x):
-        b, c, *spatial = x.shape
-        x = x.reshape(b, c, -1)
+        c, *spatial = x.shape
+        x = x.reshape(c, -1)
         qkv = self.qkv(cx, self.norm(cx, x))
         h = self.attention(cx, qkv)
         h = self.proj_out(cx, h)
-        return (x + h).reshape(b, c, *spatial)
+        return (x + h).reshape(c, *spatial)
 
 def timestep_embedding(timesteps, dim, max_period=10000):
     """
     Create sinusoidal timestep embeddings.
 
-    :param timesteps: a 1-D Tensor of N indices, one per batch element.
-                      These may be fractional.
+    :param timesteps: Scalar timestep index. These may be fractional.
     :param dim: the dimension of the output.
     :param max_period: controls the minimum frequency of the embeddings.
-    :return: an [N x dim] Tensor of positional embeddings.
+    :return: an [dim] Tensor of positional embeddings.
     """
+    assert len(timesteps.shape) == 0
     half = dim // 2
     freqs = jnp.exp(
         -np.log(max_period) * jnp.arange(start=0, stop=half, dtype=jnp.float32) / half
     )
-    args = timesteps[:, None].astype(jnp.float32) * freqs[None]
+    args = timesteps.astype(jnp.float32) * freqs
     embedding = jnp.concatenate([jnp.cos(args), jnp.sin(args)], axis=-1)
     if dim % 2:
-        embedding = jnp.concatenate.cat([embedding, jnp.zeros_like(embedding[:, :1])], axis=-1)
+        embedding = jnp.concatenate.cat([embedding, jnp.zeros_like(embedding[:1])], axis=-1)
+    assert embedding.shape == (dim,)
     return embedding
 
 class UNetModel(nn.Module):
@@ -506,20 +507,22 @@ class UNetModel(nn.Module):
         """
         Apply the model to an input batch.
 
-        :param x: an [N x C x ...] Tensor of inputs.
-        :param timesteps: a 1-D batch of timesteps.
-        :param y: an [N] Tensor of labels, if class-conditional.
-        :return: an [N x C x ...] Tensor of outputs.
+        :param x: an [C x ...] Tensor of inputs.
+        :param timesteps: a scalar timestep
+        :param y: a scalar label, if class-conditional.
+        :return: an [C x ...] Tensor of outputs.
         """
         assert (y is not None) == (
             self.num_classes is not None
         ), "must specify y if and only if the model is class-conditional"
 
+        assert len(timesteps.shape) == 0
+
         hs = []
         emb = self.time_embed(cx, timestep_embedding(timesteps, self.model_channels))
 
         if self.num_classes is not None:
-            assert y.shape == (x.shape[0],)
+            assert len(y.shape) == 0 # scalar
             emb = emb + self.label_emb(cx, y)
 
         h = x
@@ -528,6 +531,6 @@ class UNetModel(nn.Module):
             hs.append(h)
         h = self.middle_block(cx, h, emb)
         for module in self.output_blocks:
-            h = jnp.concatenate([h, hs.pop()], axis=1)
+            h = jnp.concatenate([h, hs.pop()], axis=0)
             h = module(cx, h, emb)
         return self.out(cx, h)
