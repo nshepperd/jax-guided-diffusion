@@ -23,6 +23,7 @@ sys.path.append('./CLIP_JAX')
 import clip_jax
 
 from lib.script_util import create_model_and_diffusion, model_and_diffusion_defaults
+from lib import util
 
 # Define necessary functions
 
@@ -37,49 +38,51 @@ def fetch(url_or_path):
     return open(url_or_path, 'rb')
 
 class MakeCutouts(object):
-    def __init__(self, cut_size, cutn, cut_pow=1., img_size=256):
+    def __init__(self, cut_size, cutn, cut_pow=1.):
         self.cut_size = cut_size
         self.cutn = cutn
         self.cut_pow = cut_pow
-        self.img_size = img_size
-
-        # Cutout sizes must be fixed ahead of time to avoid
-        # jit-compilation issues with variable sized tensors.  We
-        # compute them deterministically from the parameters, so that
-        # jit recompilation is only required when the parameters are
-        # changed.
-        sideX = img_size
-        sideY = img_size
-        max_size = min(sideX, sideY)
-        min_size = min(sideX, sideY, cut_size)
-        cut_us = jax.random.uniform(jax.random.PRNGKey(0), shape=[cutn])**cut_pow
-        self.cutout_sizes = (min_size + cut_us * (max_size - min_size)).astype(jnp.int32).tolist()
 
     def key(self):
-        return (self.cut_size,self.cutn,self.cut_pow,self.img_size)
+        return (self.cut_size,self.cutn,self.cut_pow)
     def __hash__(self):
         return hash(self.key())
     def __eq__(self, other):
-        if type(other) is MakeCutouts:
-            return self.key() == other.key()
+        if isinstance(other, MakeCutouts):
+            return type(self) is type(other) and self.key() == other.key()
         return NotImplemented
 
     def __call__(self, input, key):
         [b, c, h, w] = input.shape
         rng = PRNG(key)
-        cutouts = []
-        for (i, size) in enumerate(self.cutout_sizes):
-            offsetx = jax.random.randint(rng.split(), [], 0, w - size + 1)
-            offsety = jax.random.randint(rng.split(), [], 0, h - size + 1)
-            cutout = jax.lax.dynamic_slice(input,
-                                           [0, 0, offsety, offsetx],
-                                           [b, c, size, size])
-            cutout = jax.image.resize(cutout,
-                                      (input.shape[0], input.shape[1],
-                                       self.cut_size, self.cut_size),
-                                      method='bilinear')
-            cutouts.append(cutout)
-        return jnp.concatenate(cutouts, axis=0)
+        max_size = min(h, w)
+        min_size = min(h, w, self.cut_size)
+        cut_us = jax.random.uniform(rng.split(), shape=[self.cutn])**self.cut_pow
+        sizes = (min_size + cut_us * (max_size - min_size + 1)).astype(jnp.int32).clamp(min_size, max_size)
+        offsets_x = jax.random.randint(rng.split(), [self.cutn], 0, w - sizes + 1)
+        offsets_y = jax.random.randint(rng.split(), [self.cutn], 0, h - sizes + 1)
+        cutouts = util.cutouts_images(input, offsets_x, offsets_y, sizes)
+        cutouts = cutouts.rearrange('b n c h w -> (b n) c h w')
+        return cutouts
+
+class StaticCutouts(MakeCutouts):
+    def __init__(self, cut_size, cutn, size):
+        self.cut_size = cut_size
+        self.cutn = cutn
+        self.size = size
+
+    def key(self):
+        return (self.cut_size,self.cutn,self.size)
+
+    def __call__(self, input, key):
+        [b, c, h, w] = input.shape
+        rng = PRNG(key)
+        sizes = jnp.array([self.size]*self.cutn).astype(jnp.int32)
+        offsets_x = jax.random.randint(rng.split(), [self.cutn], 0, w - sizes + 1)
+        offsets_y = jax.random.randint(rng.split(), [self.cutn], 0, h - sizes + 1)
+        cutouts = util.cutouts_images(input, offsets_x, offsets_y, sizes)
+        cutouts = cutouts.rearrange('b n c h w -> (b n) c h w')
+        return cutouts
 
 
 def Normalize(mean, std):
@@ -185,7 +188,7 @@ prompt = txt(title)
 batch_size = 1
 clip_guidance_scale = 2000
 tv_scale = 600
-cutn = 16
+cutn = 128
 cut_pow = 0.5
 n_batches = 8
 init_image = None
@@ -208,7 +211,7 @@ def run():
 
     cur_t = None
 
-    make_cutouts = MakeCutouts(clip_size, cutn, cut_pow=cut_pow, img_size=model_config['image_size'])
+    make_cutouts = MakeCutouts(clip_size, cutn, cut_pow=cut_pow)
 
     def cond_fn(x, t, y=None):
         # Triggers recompilation if cutout parameters have changed (cutn or cut_pow).
