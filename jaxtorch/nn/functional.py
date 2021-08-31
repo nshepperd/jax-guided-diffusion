@@ -43,10 +43,10 @@ def conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
                                           batch_group_count=1,
                                           precision=None,
                                           preferred_element_type=None)
-    if bias is not None:
-        output = output + bias.reshape(bias.shape[0], 1, 1)
     if not batched:
         output = output.squeeze(0)
+    if bias is not None:
+        output = output + bias.reshape(bias.shape[0], 1, 1)
     return output
 
 
@@ -86,8 +86,8 @@ def conv1d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
                                           batch_group_count=1,
                                           precision=None,
                                           preferred_element_type=None)
-    if bias is not None:
-        output = output + bias.reshape(bias.shape[0], 1)
     if not batched:
         output = output.squeeze(0)
+    if bias is not None:
+        output = output + bias.reshape(bias.shape[0], 1)
     return output
