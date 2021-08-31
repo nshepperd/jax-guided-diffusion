@@ -44,7 +44,7 @@ def conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
                                           precision=None,
                                           preferred_element_type=None)
     if not batched:
-        output = output.squeeze(0)
+        output = output.reshape(output.shape[1:])
     if bias is not None:
         output = output + bias.reshape(bias.shape[0], 1, 1)
     return output
