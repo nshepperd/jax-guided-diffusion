@@ -8,6 +8,7 @@ import sys
 import time
 import os
 import functools
+from functools import partial
 
 from PIL import Image
 import requests
@@ -24,6 +25,7 @@ import clip_jax
 
 from lib.script_util import create_model_and_diffusion, model_and_diffusion_defaults
 from lib import util
+from lib.util import pil_from_tensor, pil_to_tensor
 
 # Define necessary functions
 
@@ -62,7 +64,7 @@ class MakeCutouts(object):
         offsets_x = jax.random.randint(rng.split(), [self.cutn], 0, w - sizes + 1)
         offsets_y = jax.random.randint(rng.split(), [self.cutn], 0, h - sizes + 1)
         cutouts = util.cutouts_images(input, offsets_x, offsets_y, sizes)
-        cutouts = cutouts.rearrange('b n c h w -> (b n) c h w')
+        cutouts = cutouts.rearrange('b n c h w -> (n b) c h w')
         return cutouts
 
 class StaticCutouts(MakeCutouts):
@@ -81,9 +83,8 @@ class StaticCutouts(MakeCutouts):
         offsets_x = jax.random.randint(rng.split(), [self.cutn], 0, w - sizes + 1)
         offsets_y = jax.random.randint(rng.split(), [self.cutn], 0, h - sizes + 1)
         cutouts = util.cutouts_images(input, offsets_x, offsets_y, sizes)
-        cutouts = cutouts.rearrange('b n c h w -> (b n) c h w')
+        cutouts = cutouts.rearrange('b n c h w -> (n b) c h w')
         return cutouts
-
 
 def Normalize(mean, std):
     mean = jnp.array(mean).reshape(3,1,1)
@@ -101,6 +102,9 @@ def spherical_dist_loss(x, y):
     y = norm1(y)
     return (x - y).square().sum(axis=-1).sqrt().div(2).arcsin().square().mul(2)
 
+def cborfile(path):
+    with fetch(path) as fp:
+      return jaxtorch.cbor.load(fp)
 
 def tv_loss(input):
     """L2 total variation loss, as in Mahendran et al."""
@@ -112,12 +116,19 @@ def tv_loss(input):
     y_diff = input[..., 1:, :] - input[..., :-1, :]
     return x_diff.square().mean([1,2,3]) + y_diff.square().mean([1,2,3])
 
+def downscale2d(image, f):
+  [c, n, h, w] = image.shape
+  return jax.image.resize(image, [c, n, h//f, w//f], method='linear')
+
+def rms(x):
+  return x.square().mean().sqrt()
+
 # Model settings
 
 model_config = model_and_diffusion_defaults()
 model_config.update({
     'attention_resolutions': '32, 16, 8',
-    'class_cond': True,
+    'class_cond': False,
     'diffusion_steps': 1000,
     'rescale_timesteps': True,
     'timestep_respacing': '1000',
@@ -141,7 +152,7 @@ model_params.initialize(jax.random.PRNGKey(0))
 
 print('Loading state dict...')
 # with open('256x256_diffusion_uncond.cbor', 'rb') as fp:
-with open('512x512_diffusion.cbor', 'rb') as fp:
+with open('512x512_diffusion_uncond_finetune_008100.cbor', 'rb') as fp:
     jax_state_dict = jaxtorch.cbor.load(fp)
 
 model.load_state_dict(model_params, jax_state_dict)
@@ -151,21 +162,61 @@ def exec_model(model_params, x, timesteps, y=None):
     return model(cx, x, timesteps, y=y)
 exec_model_jit = functools.partial(jax.jit(exec_model), model_params)
 
-def cond_loss(x, t, y, text_embed, cur_t, key, model_params, clip_params, clip_guidance_scale, tv_scale, make_cutouts):
+def base_cond_fn(x, t, y, text_embed, style_embed, cur_t, key, model_params, clip_params, clip_guidance_scale, style_guidance_scale, tv_scale, sat_scale, make_cutouts, make_cutouts_style):
+    rng = PRNG(key)
     n = x.shape[0]
-    my_t = jnp.ones([n], dtype=jnp.int32) * cur_t
-    out = diffusion.p_mean_variance(functools.partial(exec_model,model_params),
-                                    x, my_t, clip_denoised=False,
-                                    model_kwargs={'y': y})
-    fac = diffusion.sqrt_one_minus_alphas_cumprod[cur_t]
-    x_in = out['pred_xstart'] * fac + x * (1 - fac)
-    clip_in = normalize(make_cutouts(x_in.add(1).div(2), key))
-    image_embeds = emb_image(clip_in, clip_params).reshape([cutn, n, 512])
-    losses = spherical_dist_loss(image_embeds.mean(0), text_embed)
-    tv_losses = tv_loss(x_in)
-    loss = losses.sum() * clip_guidance_scale + tv_losses.sum() * tv_scale
-    return -loss
-base_cond_fn = jax.jit(jax.grad(cond_loss), static_argnames='make_cutouts')
+
+    def denoise(x):
+      my_t = jnp.ones([n], dtype=jnp.int32) * cur_t
+      out = diffusion.p_mean_variance(functools.partial(exec_model,model_params),
+                                      x, my_t,
+                                      clip_denoised=False,
+                                      model_kwargs={'y': y})
+      fac = diffusion.sqrt_one_minus_alphas_cumprod[cur_t]
+      x_in = out['pred_xstart'] * fac + x * (1 - fac)
+      return x_in
+    (x_in, backward) = jax.vjp(denoise, x)
+
+    def main_clip_loss(x_in, key):
+      clip_in = normalize(make_cutouts(x_in.add(1).div(2), key))
+      image_embeds = emb_image(clip_in, clip_params).reshape([make_cutouts.cutn, n, 512])
+      # Method 1. Average the clip embeds, then compute great circle distance.
+      # losses = spherical_dist_loss(image_embeds.mean(0), text_embed)
+      # Method 2. Compute great circle losses for clip embeds, then average.
+      losses = spherical_dist_loss(image_embeds, text_embed).mean(0)
+      return losses.sum() * clip_guidance_scale
+
+    # Scan method, should reduce jit times...
+    num_cuts = 4
+    keys = jnp.stack([rng.split() for _ in range(num_cuts)])
+    main_clip_grad = jax.lax.scan(lambda total, key: (total + jax.grad(main_clip_loss)(x_in, key), key),
+                                  jnp.zeros_like(x_in),
+                                  keys)[0] / num_cuts
+
+    if style_embed is not None:
+      def style_loss(x_in, key):
+        clip_in = normalize(make_cutouts_style(x_in.add(1).div(2), key))
+        image_embeds = emb_image(clip_in, clip_params).reshape([make_cutouts_style.cutn, n, 512])
+        style_losses = spherical_dist_loss(image_embeds, style_embed).mean(0)
+        return style_losses.sum() * style_guidance_scale
+      main_clip_grad += jax.grad(style_loss)(x_in, rng.split())
+
+    def sum_tv_loss(x_in, f=None):
+      if f is not None:
+        x_in = downscale2d(x_in, f)
+      return tv_loss(x_in).sum() * tv_scale
+    tv_grad_512 = jax.grad(sum_tv_loss)(x_in)
+    tv_grad_256 = jax.grad(partial(sum_tv_loss,f=2))(x_in)
+    tv_grad_128 = jax.grad(partial(sum_tv_loss,f=4))(x_in)
+    main_clip_grad += tv_grad_512 + tv_grad_256 + tv_grad_128
+
+    def saturation_loss(x_in):
+      return jnp.abs(x_in - x_in.clamp(min=-1,max=1)).mean()
+    sat_grad = sat_scale * jax.grad(saturation_loss)(x_in)
+    main_clip_grad += sat_grad
+
+    return (-backward(main_clip_grad)[0], tv_grad_512, tv_grad_256, tv_grad_128, sat_grad)
+base_cond_fn = jax.jit(base_cond_fn, static_argnames=['make_cutouts', 'make_cutouts_style'])
 
 print('Loading CLIP model...')
 image_fn, text_fn, clip_params, _ = clip_jax.load('ViT-B/32') #, "cpu")
@@ -183,14 +234,18 @@ def txt(prompt):
 def emb_image(image, clip_params=None):
     return norm1(image_fn(clip_params, image))
 
-title = "clockwork angel of crystal | unreal engine"
-prompt = txt(title)
+title = ['sigil of the knight of time. trending on ArtStation']
+prompt = [txt(t) for t in title]
+style_embed = norm1(jnp.array(cborfile('data/openimages_512x_png_embed224.cbor'))) - norm1(jnp.array(cborfile('data/imagenet_512x_jpg_embed224.cbor')))
 batch_size = 1
 clip_guidance_scale = 2000
-tv_scale = 600
-cutn = 128
+style_guidance_scale = 300
+tv_scale = 150
+sat_scale = 150
+cutn = 32 # effective cutn is 4x this because we do 4 iterations in base_cond_fn
 cut_pow = 0.5
-n_batches = 8
+style_cutn = 32
+n_batches = 4
 init_image = None
 skip_timesteps = 0
 seed = 1
@@ -212,20 +267,38 @@ def run():
     cur_t = None
 
     make_cutouts = MakeCutouts(clip_size, cutn, cut_pow=cut_pow)
+    make_cutouts_style = StaticCutouts(clip_size, style_cutn, size=224)
 
     def cond_fn(x, t, y=None):
         # Triggers recompilation if cutout parameters have changed (cutn or cut_pow).
-        return base_cond_fn(x, jnp.array(t), y=y,
+        grad = base_cond_fn(x, jnp.array(t), y,
                             text_embed=text_embed,
+                            style_embed=style_embed,
                             cur_t=jnp.array(cur_t),
                             key=rng.split(),
                             model_params=model_params,
                             clip_params=clip_params,
                             clip_guidance_scale = clip_guidance_scale,
+                            style_guidance_scale = style_guidance_scale,
                             tv_scale = tv_scale,
-                            make_cutouts=make_cutouts)
+                            sat_scale = sat_scale,
+                            make_cutouts=make_cutouts,
+                            make_cutouts_style=make_cutouts_style)
+        (grad, tv1, tv2, tv4, sat) = grad
+        if int(t)%10 == 0:
+          print(t, rms(tv1), rms(tv2), rms(tv4), rms(sat))
+        magnitude = grad.square().mean().sqrt()
+        grad = grad / magnitude * magnitude.clamp(max=0.1)
+        return grad
 
     for i in range(n_batches):
+        if type(prompt) is list:
+          text_embed = prompt[i % len(prompt)]
+          this_title = title[i % len(prompt)]
+        else:
+          text_embed = prompt
+          this_title = title
+
         cur_t = diffusion.num_timesteps - skip_timesteps - 1
 
         samples = diffusion.p_sample_loop_progressive(
@@ -233,13 +306,11 @@ def run():
             (batch_size, 3, model_config['image_size'], model_config['image_size']),
             rng=rng,
             clip_denoised=False,
-            model_kwargs={'y': jnp.zeros([batch_size], dtype=jnp.int32)},
+            model_kwargs={},
             cond_fn=cond_fn,
             progress=tqdm,
             skip_timesteps=skip_timesteps,
             init_image=init,
-            randomize_class=True,
-            num_classes=model.num_classes
         )
 
         for j, sample in enumerate(samples):
@@ -250,12 +321,7 @@ def run():
                     filename = f'progress_{i * batch_size + k:05}.png'
                     # print(k, type(image).mro())
                     # For some reason this comes out as a numpy array. Huh?
-                    image = jnp.array(image)
-                    image = image.add(1).div(2).clamp(0, 1)
-                    image = jnp.transpose(image, (1, 2, 0))
-                    image = (image * 256).clamp(0, 255)
-                    image = np.array(image).astype('uint8')
-                    image = Image.fromarray(image)
+                    image = pil_from_tensor(jnp.array(image).add(1).div(2))
                     image.save(filename)
                     print(f'Wrote {filename}')
 

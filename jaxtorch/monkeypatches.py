@@ -20,6 +20,7 @@ def register(**kwargs):
 register(
     square = lambda arr: arr**2,
     sqrt = lambda arr: jax.numpy.sqrt(arr),
+    abs = jax.numpy.abs,
     add = lambda a, b: a + b,
     sub = lambda a, b: a - b,
     div = lambda a, b: a / b,
