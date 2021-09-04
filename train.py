@@ -20,18 +20,7 @@ from einops import rearrange
 import jax.experimental.optimizers
 
 from lib.script_util import create_model_and_diffusion, model_and_diffusion_defaults
-
-def pil_to_tensor(pil_image):
-  img = np.array(pil_image).astype('float32')
-  img = jnp.array(img) / 255
-  img = rearrange(img, 'h w c -> c h w')
-  return img
-
-def pil_from_tensor(image):
-  image = rearrange(image, 'c h w -> h w c')
-  image = (image * 256).clamp(0, 255)
-  image = np.array(image).astype('uint8')
-  return Image.fromarray(image)
+from lib.util import pil_to_tensor, pil_from_tensor
 
 def make_cutout(image, key):
     rng = PRNG(key)
@@ -71,7 +60,6 @@ model_config.update({
     'num_head_channels': 64,
     'num_res_blocks': 2,
     'resblock_updown': True,
-    # 'use_fp16': True,
     'use_scale_shift_norm': True,
 })
 
