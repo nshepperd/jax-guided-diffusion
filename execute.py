@@ -39,6 +39,13 @@ def fetch(url_or_path):
         return fd
     return open(url_or_path, 'rb')
 
+def load_torch(checkpoint):
+    import torch
+    with torch.no_grad():
+        state_dict = torch.load(checkpoint, map_location=torch.device('cpu'))
+        jax_state_dict = {name : par.cpu().numpy() for (name, par) in state_dict.items()}
+        return jax_state_dict
+
 class MakeCutouts(object):
     def __init__(self, cut_size, cutn, cut_pow=1.):
         self.cut_size = cut_size
@@ -151,9 +158,9 @@ model_params = ParamState(model.labeled_parameters_())
 model_params.initialize(jax.random.PRNGKey(0))
 
 print('Loading state dict...')
-# with open('256x256_diffusion_uncond.cbor', 'rb') as fp:
-with open('512x512_diffusion_uncond_finetune_008100.cbor', 'rb') as fp:
-    jax_state_dict = jaxtorch.cbor.load(fp)
+jax_state_dict = load_torch('512x512_diffusion_uncond_finetune_008100.pt')
+# with open('512x512_diffusion_uncond_finetune_008100.cbor', 'rb') as fp:
+#     jax_state_dict = jaxtorch.cbor.load(fp)
 
 model.load_state_dict(model_params, jax_state_dict)
 
@@ -161,8 +168,13 @@ def exec_model(model_params, x, timesteps, y=None):
     cx = Context(model_params, jax.random.PRNGKey(0))
     return model(cx, x, timesteps, y=y)
 exec_model_jit = functools.partial(jax.jit(exec_model), model_params)
+exec_model_par_base = jax.pmap(exec_model, in_axes=(None, 0, 0), out_axes=0, devices=jax.devices()[1:])
+def exec_model_par(x, timesteps, y=None):
+    return exec_model_par_base(model_params, x.unsqueeze(1), timesteps.unsqueeze(1)).squeeze(1)
 
-def base_cond_fn(x, t, y, text_embed, style_embed, cur_t, key, model_params, clip_params, clip_guidance_scale, style_guidance_scale, tv_scale, sat_scale, make_cutouts, make_cutouts_style):
+def base_cond_fn(x, t, cur_t, params, key, make_cutouts, make_cutouts_style):
+    text_embed, style_embed, model_params, clip_params, clip_guidance_scale, style_guidance_scale, tv_scale, sat_scale = params
+
     rng = PRNG(key)
     n = x.shape[0]
 
@@ -171,7 +183,7 @@ def base_cond_fn(x, t, y, text_embed, style_embed, cur_t, key, model_params, cli
       out = diffusion.p_mean_variance(functools.partial(exec_model,model_params),
                                       x, my_t,
                                       clip_denoised=False,
-                                      model_kwargs={'y': y})
+                                      model_kwargs={})
       fac = diffusion.sqrt_one_minus_alphas_cumprod[cur_t]
       x_in = out['pred_xstart'] * fac + x * (1 - fac)
       return x_in
@@ -215,8 +227,10 @@ def base_cond_fn(x, t, y, text_embed, style_embed, cur_t, key, model_params, cli
     sat_grad = sat_scale * jax.grad(saturation_loss)(x_in)
     main_clip_grad += sat_grad
 
-    return (-backward(main_clip_grad)[0], tv_grad_512, tv_grad_256, tv_grad_128, sat_grad)
-base_cond_fn = jax.jit(base_cond_fn, static_argnames=['make_cutouts', 'make_cutouts_style'])
+    return -backward(main_clip_grad)[0]
+# base_cond_fn = jax.jit(base_cond_fn, static_argnames=['make_cutouts', 'make_cutouts_style'])
+base_cond_fn = jax.pmap(base_cond_fn, in_axes = (0, 0, None, None, 0, None, None), out_axes=0, static_broadcasted_argnums=(5,6),
+                        devices=jax.devices()[1:])
 
 print('Loading CLIP model...')
 image_fn, text_fn, clip_params, _ = clip_jax.load('ViT-B/32') #, "cpu")
@@ -234,10 +248,10 @@ def txt(prompt):
 def emb_image(image, clip_params=None):
     return norm1(image_fn(clip_params, image))
 
-title = ['sigil of the knight of time. trending on ArtStation']
+title = ['the portal to hell was discovered on a siberian plateau. trending on ArtStation']
 prompt = [txt(t) for t in title]
 style_embed = norm1(jnp.array(cborfile('data/openimages_512x_png_embed224.cbor'))) - norm1(jnp.array(cborfile('data/imagenet_512x_jpg_embed224.cbor')))
-batch_size = 1
+batch_size = 7
 clip_guidance_scale = 2000
 style_guidance_scale = 300
 tv_scale = 150
@@ -245,7 +259,7 @@ sat_scale = 150
 cutn = 32 # effective cutn is 4x this because we do 4 iterations in base_cond_fn
 cut_pow = 0.5
 style_cutn = 32
-n_batches = 4
+n_batches = len(title)
 init_image = None
 skip_timesteps = 0
 seed = 1
@@ -270,24 +284,18 @@ def run():
     make_cutouts_style = StaticCutouts(clip_size, style_cutn, size=224)
 
     def cond_fn(x, t, y=None):
+        # x : [n, c, h, w]
+        n = x.shape[0]
         # Triggers recompilation if cutout parameters have changed (cutn or cut_pow).
-        grad = base_cond_fn(x, jnp.array(t), y,
-                            text_embed=text_embed,
-                            style_embed=style_embed,
-                            cur_t=jnp.array(cur_t),
-                            key=rng.split(),
-                            model_params=model_params,
-                            clip_params=clip_params,
-                            clip_guidance_scale = clip_guidance_scale,
-                            style_guidance_scale = style_guidance_scale,
-                            tv_scale = tv_scale,
-                            sat_scale = sat_scale,
-                            make_cutouts=make_cutouts,
-                            make_cutouts_style=make_cutouts_style)
-        (grad, tv1, tv2, tv4, sat) = grad
-        if int(t)%10 == 0:
-          print(t, rms(tv1), rms(tv2), rms(tv4), rms(sat))
-        magnitude = grad.square().mean().sqrt()
+        grad = base_cond_fn(x.unsqueeze(1), jnp.array(t).unsqueeze(1), jnp.array(cur_t),
+                            (text_embed, style_embed, model_params, clip_params, clip_guidance_scale, style_guidance_scale, tv_scale, sat_scale),
+                            jnp.stack([rng.split() for _ in range(n)]),
+                            make_cutouts,
+                            make_cutouts_style)
+        # grad : [n, 1, c, h, w]
+        grad = grad.squeeze(1)
+        # grad : [n, c, h, w]
+        magnitude = grad.square().mean(axis=(1,2,3), keepdims=True).sqrt()
         grad = grad / magnitude * magnitude.clamp(max=0.1)
         return grad
 
@@ -302,7 +310,7 @@ def run():
         cur_t = diffusion.num_timesteps - skip_timesteps - 1
 
         samples = diffusion.p_sample_loop_progressive(
-            exec_model_jit,
+            exec_model_par,
             (batch_size, 3, model_config['image_size'], model_config['image_size']),
             rng=rng,
             clip_denoised=False,
@@ -325,15 +333,14 @@ def run():
                     image.save(filename)
                     print(f'Wrote {filename}')
 
-        # for k in range(batch_size):
-        #     filename = f'progress_{i * batch_size + k:05}.png'
-        #     timestring = time.strftime('%Y%m%d%H%M%S')
-        #     os.makedirs('samples', exist_ok=True)
-        #     dname = f'samples/{timestring}_{k}_{title}.png'
-        #     with open(filename, 'rb') as fp:
-        #       data = fp.read()
-        #     with open(dname, 'wb') as fp:
-        #       fp.write(data)
-        #     files.download(dname)
+        for k in range(batch_size):
+            filename = f'progress_{i * batch_size + k:05}.png'
+            timestring = time.strftime('%Y%m%d%H%M%S')
+            os.makedirs('samples', exist_ok=True)
+            dname = f'samples/{timestring}_{k}_{this_title}.png'
+            with open(filename, 'rb') as fp:
+              data = fp.read()
+            with open(dname, 'wb') as fp:
+              fp.write(data)
 
 run()
