@@ -248,7 +248,11 @@ def txt(prompt):
 def emb_image(image, clip_params=None):
     return norm1(image_fn(clip_params, image))
 
-title = ['the portal to hell was discovered on a siberian plateau. trending on ArtStation']
+def cosim(a, b):
+    return (txt(a) * txt(b)).sum(-1)
+
+title = ['a tiger made of light is in the beautiful forest. trending on ArtStation',
+         'a beautiful fantasy forest with cute tigers. trending on ArtStation']
 prompt = [txt(t) for t in title]
 style_embed = norm1(jnp.array(cborfile('data/openimages_512x_png_embed224.cbor'))) - norm1(jnp.array(cborfile('data/imagenet_512x_jpg_embed224.cbor')))
 batch_size = 7
@@ -259,10 +263,10 @@ sat_scale = 150
 cutn = 32 # effective cutn is 4x this because we do 4 iterations in base_cond_fn
 cut_pow = 0.5
 style_cutn = 32
-n_batches = len(title)
+n_batches = len(title)*2
 init_image = None
 skip_timesteps = 0
-seed = 1
+seed = 2
 
 # Actually do the run
 print('Starting run...')
@@ -300,6 +304,8 @@ def run():
         return grad
 
     for i in range(n_batches):
+        timestring = time.strftime('%Y%m%d%H%M%S')
+
         if type(prompt) is list:
           text_embed = prompt[i % len(prompt)]
           this_title = title[i % len(prompt)]
@@ -332,10 +338,13 @@ def run():
                     image = pil_from_tensor(jnp.array(image).add(1).div(2))
                     image.save(filename)
                     print(f'Wrote {filename}')
+                    if j >= 500:
+                        os.makedirs('progress', exist_ok=True)
+                        filename = f'progress/{timestring}_{this_title}_{k:05}_{j:03}.png'
+                        image.save(filename)
 
         for k in range(batch_size):
             filename = f'progress_{i * batch_size + k:05}.png'
-            timestring = time.strftime('%Y%m%d%H%M%S')
             os.makedirs('samples', exist_ok=True)
             dname = f'samples/{timestring}_{k}_{this_title}.png'
             with open(filename, 'rb') as fp:
