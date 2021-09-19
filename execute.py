@@ -15,10 +15,13 @@ import requests
 
 import numpy as np
 import jax
+import jax.profiler
 import jax.numpy as jnp
 import jaxtorch
 from jaxtorch import PRNG, Context, ParamState, Module
 from tqdm import tqdm
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import threading, json
 
 sys.path.append('./CLIP_JAX')
 import clip_jax
@@ -46,6 +49,10 @@ def load_torch(checkpoint):
         jax_state_dict = {name : par.cpu().numpy() for (name, par) in state_dict.items()}
         return jax_state_dict
 
+def grey(image):
+    [*_, c, h, w] = image.shape
+    return jnp.broadcast_to(image.mean(axis=-3, keepdims=True), image.shape)
+
 class MakeCutouts(object):
     def __init__(self, cut_size, cutn, cut_pow=1.):
         self.cut_size = cut_size
@@ -66,11 +73,22 @@ class MakeCutouts(object):
         rng = PRNG(key)
         max_size = min(h, w)
         min_size = min(h, w, self.cut_size)
-        cut_us = jax.random.uniform(rng.split(), shape=[self.cutn])**self.cut_pow
+        cut_us = jax.random.uniform(rng.split(), shape=[self.cutn//2])**self.cut_pow
         sizes = (min_size + cut_us * (max_size - min_size + 1)).astype(jnp.int32).clamp(min_size, max_size)
-        offsets_x = jax.random.randint(rng.split(), [self.cutn], 0, w - sizes + 1)
-        offsets_y = jax.random.randint(rng.split(), [self.cutn], 0, h - sizes + 1)
+        offsets_x = jax.random.uniform(rng.split(), [self.cutn//2], minval=0, maxval=w - sizes)
+        offsets_y = jax.random.uniform(rng.split(), [self.cutn//2], minval=0, maxval=h - sizes)
         cutouts = util.cutouts_images(input, offsets_x, offsets_y, sizes)
+
+        lcut_us = jax.random.uniform(rng.split(), shape=[self.cutn//2])
+        lsizes = (max_size + 10 + lcut_us * 10).astype(jnp.int32)
+        loffsets_x = jax.random.uniform(rng.split(), [self.cutn//2], minval=w - lsizes, maxval=0)
+        loffsets_y = jax.random.uniform(rng.split(), [self.cutn//2], minval=h - lsizes, maxval=0)
+        lcutouts = util.cutouts_images(input, loffsets_x, loffsets_y, lsizes)
+
+        cutouts = jnp.concatenate([cutouts, lcutouts], axis=1)
+
+        grey_us = jax.random.uniform(rng.split(), shape=[b, self.cutn, 1, 1, 1])
+        cutouts = jnp.where(grey_us < 0.2, grey(cutouts), cutouts)
         cutouts = cutouts.rearrange('b n c h w -> (n b) c h w')
         return cutouts
 
@@ -172,7 +190,7 @@ exec_model_par_base = jax.pmap(exec_model, in_axes=(None, 0, 0), out_axes=0, dev
 def exec_model_par(x, timesteps, y=None):
     return exec_model_par_base(model_params, x.unsqueeze(1), timesteps.unsqueeze(1)).squeeze(1)
 
-def base_cond_fn(x, t, cur_t, params, key, make_cutouts, make_cutouts_style):
+def base_cond_fn(x, t, cur_t, params, key, make_cutouts, make_cutouts_style, cut_batches):
     text_embed, style_embed, model_params, clip_params, clip_guidance_scale, style_guidance_scale, tv_scale, sat_scale = params
 
     rng = PRNG(key)
@@ -199,8 +217,9 @@ def base_cond_fn(x, t, cur_t, params, key, make_cutouts, make_cutouts_style):
       return losses.sum() * clip_guidance_scale
 
     # Scan method, should reduce jit times...
-    num_cuts = 4
-    keys = jnp.stack([rng.split() for _ in range(num_cuts)])
+    num_cuts = cut_batches
+    cut_rng = PRNG(rng.split())
+    keys = jnp.stack([cut_rng.split() for _ in range(num_cuts)])
     main_clip_grad = jax.lax.scan(lambda total, key: (total + jax.grad(main_clip_loss)(x_in, key), key),
                                   jnp.zeros_like(x_in),
                                   keys)[0] / num_cuts
@@ -211,7 +230,14 @@ def base_cond_fn(x, t, cur_t, params, key, make_cutouts, make_cutouts_style):
         image_embeds = emb_image(clip_in, clip_params).reshape([make_cutouts_style.cutn, n, 512])
         style_losses = spherical_dist_loss(image_embeds, style_embed).mean(0)
         return style_losses.sum() * style_guidance_scale
-      main_clip_grad += jax.grad(style_loss)(x_in, rng.split())
+      # main_clip_grad += jax.grad(style_loss)(x_in, rng.split())
+
+      num_cuts = cut_batches
+      cut_rng = PRNG(rng.split())
+      keys = jnp.stack([cut_rng.split() for _ in range(num_cuts)])
+      main_clip_grad += jax.lax.scan(lambda total, key: (total + jax.grad(style_loss)(x_in, key), key),
+                                     jnp.zeros_like(x_in),
+                                     keys)[0] / num_cuts
 
     def sum_tv_loss(x_in, f=None):
       if f is not None:
@@ -229,7 +255,7 @@ def base_cond_fn(x, t, cur_t, params, key, make_cutouts, make_cutouts_style):
 
     return -backward(main_clip_grad)[0]
 # base_cond_fn = jax.jit(base_cond_fn, static_argnames=['make_cutouts', 'make_cutouts_style'])
-base_cond_fn = jax.pmap(base_cond_fn, in_axes = (0, 0, None, None, 0, None, None), out_axes=0, static_broadcasted_argnums=(5,6),
+base_cond_fn = jax.pmap(base_cond_fn, in_axes = (0, 0, None, None, 0, None, None), out_axes=0, static_broadcasted_argnums=(5,6,7),
                         devices=jax.devices()[1:])
 
 print('Loading CLIP model...')
@@ -251,36 +277,46 @@ def emb_image(image, clip_params=None):
 def cosim(a, b):
     return (txt(a) * txt(b)).sum(-1)
 
-title = ['a tiger made of light is in the beautiful forest. trending on ArtStation',
-         'a beautiful fantasy forest with cute tigers. trending on ArtStation']
+title = ['a princess made of sakura petals in a pastoral meadow. trending on ArtStation']
 prompt = [txt(t) for t in title]
 style_embed = norm1(jnp.array(cborfile('data/openimages_512x_png_embed224.cbor'))) - norm1(jnp.array(cborfile('data/imagenet_512x_jpg_embed224.cbor')))
 batch_size = 7
+
 clip_guidance_scale = 2000
 style_guidance_scale = 300
 tv_scale = 150
 sat_scale = 150
-cutn = 32 # effective cutn is 4x this because we do 4 iterations in base_cond_fn
+
+cutn = 32 # effective cutn is cut_batches * this
 cut_pow = 0.5
+cut_batches = 16
 style_cutn = 32
-n_batches = len(title)*2
-init_image = None
+
+n_batches = len(title)
+init_image = None #'https://zlkj.in/dalle/generated/2bcef7cbfa690a06a77acca7ac209718.png'
 skip_timesteps = 0
-seed = 2
+seed = 13
 
 # Actually do the run
-print('Starting run...')
+
+def proc_init_image(init_image):
+    init = Image.open(fetch(init_image)).convert('RGB')
+    init = init.resize((model_config['image_size'], model_config['image_size']), Image.LANCZOS)
+    init = pil_to_tensor(init).unsqueeze(0).mul(2).sub(1)
+    return init
 
 def run():
+    print('Starting run...')
     rng = PRNG(jax.random.PRNGKey(seed))
 
     text_embed = prompt
 
     init = None
-    # if init_image is not None:
-    #     init = Image.open(fetch(init_image)).convert('RGB')
-    #     init = init.resize((model_config['image_size'], model_config['image_size']), Image.LANCZOS)
-    #     init = TF.to_tensor(init).to(device).unsqueeze(0).mul(2).sub(1)
+    if init_image is not None:
+        if type(init_image) is list:
+            init = jnp.concatenate([proc_init_image(url) for url in init_image], axis=0)
+        else:
+            init = proc_init_image(init_image)
 
     cur_t = None
 
@@ -295,7 +331,8 @@ def run():
                             (text_embed, style_embed, model_params, clip_params, clip_guidance_scale, style_guidance_scale, tv_scale, sat_scale),
                             jnp.stack([rng.split() for _ in range(n)]),
                             make_cutouts,
-                            make_cutouts_style)
+                            make_cutouts_style,
+                            cut_batches)
         # grad : [n, 1, c, h, w]
         grad = grad.squeeze(1)
         # grad : [n, c, h, w]
@@ -352,4 +389,78 @@ def run():
             with open(dname, 'wb') as fp:
               fp.write(data)
 
+
 run()
+
+
+class FIFOLock(object):
+    def __init__(self):
+        self.cv = threading.Condition()
+        self.waiting = []
+        self.active = None
+    def __enter__(self):
+        self.acquire()
+    def __exit__(self, type, value, traceback):
+        self.release()
+
+    def can_go(self, tid):
+        return self.active is None and self.waiting[:1] == [tid]
+
+    def acquire(self):
+        tid = threading.currentThread().ident
+        self.waiting.append(tid)
+        with self.cv:
+            self.cv.wait_for(functools.partial(self.can_go, tid))
+            self.active = tid
+            del self.waiting[0]
+
+    def release(self):
+        with self.cv:
+            self.active = None
+            self.cv.notify_all()
+
+def handler(ui):
+    class Handler(BaseHTTPRequestHandler):
+        def sendmsg(self, msg):
+            self.wfile.write(json.dumps(msg).encode('utf-8'))
+            self.wfile.write(b'\n')
+
+        def do_POST(self):
+            path = '/' + self.path.strip('/')
+            if path == '/generate':
+                content_length = int(self.headers['Content-Length'])
+                data = self.rfile.read(content_length)
+                params = json.loads(data)
+                with ui.lock:
+                    globals()['title'] = params['title']
+                    globals()['prompt'] = txt(params['title'])
+                    globals()['n_batches'] = 1
+                    globals()['init_image'] = params.get('init_image', None)
+                    if 'init_image' in params:
+                        globals()['skip_timesteps'] = int(
+                            params.get('skip_timesteps', 500))
+                    else:
+                        globals()['skip_timesteps'] = 0
+                    globals()['seed'] = int(params['seed'])
+                    globals()['cut_batches'] = int(params.get('cut_batches', 4))
+                    run()
+                self.send_response(200)
+                self.end_headers()
+
+    return Handler
+
+class UiServer(object):
+    def __init__(self, port=8544):
+        self.httpd = ThreadingHTTPServer(('0.0.0.0', port), handler(self))
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        self.lock = FIFOLock()
+
+def run_server():
+    try:
+        server = UiServer()
+        server.thread.join()
+    except KeyboardInterrupt:
+        exit()
+
+# run_server()

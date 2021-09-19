@@ -29,4 +29,5 @@ register(
     clamp = lambda a, min=None, max=None: jax.numpy.clip(a, a_min=min, a_max=max),
     unsqueeze = lambda arr, axis=0: jax.numpy.expand_dims(arr, axis),
     rearrange = rearrange,
+    broadcast_to = jax.numpy.broadcast_to,
 )
