@@ -182,13 +182,26 @@ jax_state_dict = load_torch('512x512_diffusion_uncond_finetune_008100.pt')
 
 model.load_state_dict(model_params, jax_state_dict)
 
-def exec_model(model_params, x, timesteps, y=None):
-    cx = Context(model_params, jax.random.PRNGKey(0))
-    return model(cx, x, timesteps, y=y)
+RANDOM_FLIP=True
+
+def exec_model(model_params, x, timesteps, key, y=None):
+    [b, c, h, w] = x.shape
+    rng = PRNG(key)
+    if RANDOM_FLIP:
+        flip_us = jax.random.uniform(rng.split(), [b, 1, 1, 1])
+        x = jnp.where(flip_us < 0.5, jnp.flip(x, axis=3), x)
+        shift = jax.random.randint(rng.split(), [2], minval=-10, maxval=11)
+        x = jnp.roll(x, shift, (2, 3))
+    cx = Context(model_params, rng.split())
+    out = model(cx, x, timesteps, y=y)
+    if RANDOM_FLIP:
+        out = jnp.roll(out, -shift, (2, 3))
+        out = jnp.where(flip_us < 0.5, jnp.flip(out, axis=3), out)
+    return out
 exec_model_jit = functools.partial(jax.jit(exec_model), model_params)
-exec_model_par_base = jax.pmap(exec_model, in_axes=(None, 0, 0), out_axes=0, devices=jax.devices()[1:])
-def exec_model_par(x, timesteps, y=None):
-    return exec_model_par_base(model_params, x.unsqueeze(1), timesteps.unsqueeze(1)).squeeze(1)
+exec_model_par_base = jax.pmap(exec_model, in_axes=(None, 0, 0, None), out_axes=0, devices=jax.devices()[1:])
+def exec_model_par(x, timesteps, key, y=None):
+    return exec_model_par_base(model_params, x.unsqueeze(1), timesteps.unsqueeze(1), key).squeeze(1)
 
 def base_cond_fn(x, t, cur_t, params, key, make_cutouts, make_cutouts_style, cut_batches):
     text_embed, style_embed, model_params, clip_params, clip_guidance_scale, style_guidance_scale, tv_scale, sat_scale = params
@@ -196,16 +209,16 @@ def base_cond_fn(x, t, cur_t, params, key, make_cutouts, make_cutouts_style, cut
     rng = PRNG(key)
     n = x.shape[0]
 
-    def denoise(x):
+    def denoise(key, x):
       my_t = jnp.ones([n], dtype=jnp.int32) * cur_t
       out = diffusion.p_mean_variance(functools.partial(exec_model,model_params),
-                                      x, my_t,
+                                      x, my_t, key,
                                       clip_denoised=False,
                                       model_kwargs={})
       fac = diffusion.sqrt_one_minus_alphas_cumprod[cur_t]
       x_in = out['pred_xstart'] * fac + x * (1 - fac)
       return x_in
-    (x_in, backward) = jax.vjp(denoise, x)
+    (x_in, backward) = jax.vjp(partial(denoise, rng.split()), x)
 
     def main_clip_loss(x_in, key):
       clip_in = normalize(make_cutouts(x_in.add(1).div(2), key))
@@ -277,15 +290,15 @@ def emb_image(image, clip_params=None):
 def cosim(a, b):
     return (txt(a) * txt(b)).sum(-1)
 
-title = ['a princess made of sakura petals in a pastoral meadow. trending on ArtStation']
+title = ['clockwork demon of consciousness. trending on ArtStation']
 prompt = [txt(t) for t in title]
 style_embed = norm1(jnp.array(cborfile('data/openimages_512x_png_embed224.cbor'))) - norm1(jnp.array(cborfile('data/imagenet_512x_jpg_embed224.cbor')))
 batch_size = 7
 
-clip_guidance_scale = 2000
+clip_guidance_scale = 1000
 style_guidance_scale = 300
 tv_scale = 150
-sat_scale = 150
+sat_scale = 600
 
 cutn = 32 # effective cutn is cut_batches * this
 cut_pow = 0.5
@@ -295,7 +308,7 @@ style_cutn = 32
 n_batches = len(title)
 init_image = None #'https://zlkj.in/dalle/generated/2bcef7cbfa690a06a77acca7ac209718.png'
 skip_timesteps = 0
-seed = 13
+seed = 17
 
 # Actually do the run
 
@@ -390,7 +403,7 @@ def run():
               fp.write(data)
 
 
-run()
+# run()
 
 
 class FIFOLock(object):
@@ -463,4 +476,4 @@ def run_server():
     except KeyboardInterrupt:
         exit()
 
-# run_server()
+run_server()

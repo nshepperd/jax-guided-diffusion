@@ -40,3 +40,9 @@ def pil_from_tensor(image):
   image = (image * 256).clamp(0, 255)
   image = np.array(image).astype('uint8')
   return Image.fromarray(image)
+
+# def pil_from_tensor(image):
+#   image = image.transpose(1,2,0)
+#   image = jnp.clip(image * 256, 0, 255)
+#   image = np.array(image).astype('uint8')
+#   return Image.fromarray(image)
