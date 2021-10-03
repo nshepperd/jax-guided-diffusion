@@ -58,6 +58,7 @@ class MakeCutouts(object):
         self.cut_size = cut_size
         self.cutn = cutn
         self.cut_pow = cut_pow
+        self.p_grey = 0.2
 
     def key(self):
         return (self.cut_size,self.cutn,self.cut_pow)
@@ -88,7 +89,7 @@ class MakeCutouts(object):
         cutouts = jnp.concatenate([cutouts, lcutouts], axis=1)
 
         grey_us = jax.random.uniform(rng.split(), shape=[b, self.cutn, 1, 1, 1])
-        cutouts = jnp.where(grey_us < 0.2, grey(cutouts), cutouts)
+        cutouts = jnp.where(grey_us < self.p_grey, grey(cutouts), cutouts)
         cutouts = cutouts.rearrange('b n c h w -> (n b) c h w')
         return cutouts
 
@@ -183,6 +184,7 @@ jax_state_dict = load_torch('512x512_diffusion_uncond_finetune_008100.pt')
 model.load_state_dict(model_params, jax_state_dict)
 
 RANDOM_FLIP=True
+RANDOM_SHIFT=True
 
 def exec_model(model_params, x, timesteps, key, y=None):
     [b, c, h, w] = x.shape
@@ -190,12 +192,14 @@ def exec_model(model_params, x, timesteps, key, y=None):
     if RANDOM_FLIP:
         flip_us = jax.random.uniform(rng.split(), [b, 1, 1, 1])
         x = jnp.where(flip_us < 0.5, jnp.flip(x, axis=3), x)
+    if RANDOM_SHIFT:
         shift = jax.random.randint(rng.split(), [2], minval=-10, maxval=11)
         x = jnp.roll(x, shift, (2, 3))
     cx = Context(model_params, rng.split())
     out = model(cx, x, timesteps, y=y)
-    if RANDOM_FLIP:
+    if RANDOM_SHIFT:
         out = jnp.roll(out, -shift, (2, 3))
+    if RANDOM_FLIP:
         out = jnp.where(flip_us < 0.5, jnp.flip(out, axis=3), out)
     return out
 exec_model_jit = functools.partial(jax.jit(exec_model), model_params)
@@ -336,8 +340,6 @@ def proc_init_image(init_image):
 def run():
     print('Starting run...')
     rng = PRNG(jax.random.PRNGKey(seed))
-
-    text_embed = prompt
 
     init = None
     if init_image is not None:
