@@ -207,8 +207,8 @@ exec_model_par_base = jax.pmap(exec_model, in_axes=(None, 0, 0, None), out_axes=
 def exec_model_par(x, timesteps, key, y=None):
     return exec_model_par_base(model_params, x.unsqueeze(1), timesteps.unsqueeze(1), key).squeeze(1)
 
-def base_cond_fn(x, t, cur_t, params, key, make_cutouts, make_cutouts_style, cut_batches):
-    text_embed, style_embed, model_params, clip_params, clip_guidance_scale, style_guidance_scale, tv_scale, sat_scale = params
+def base_cond_fn(x, t, cur_t, text_embed, params, key, make_cutouts, make_cutouts_style, cut_batches):
+    style_embed, model_params, clip_params, clip_guidance_scale, style_guidance_scale, tv_scale, sat_scale = params
 
     rng = PRNG(key)
     n = x.shape[0]
@@ -272,7 +272,16 @@ def base_cond_fn(x, t, cur_t, params, key, make_cutouts, make_cutouts_style, cut
 
     return -backward(main_clip_grad)[0]
 # base_cond_fn = jax.jit(base_cond_fn, static_argnames=['make_cutouts', 'make_cutouts_style'])
-base_cond_fn = jax.pmap(base_cond_fn, in_axes = (0, 0, None, None, 0, None, None), out_axes=0, static_broadcasted_argnums=(5,6,7),
+base_cond_fn = jax.pmap(base_cond_fn, in_axes = (0, # x,
+                                                 0, # t,
+                                                 None, # cur_t,
+                                                 0, # text_embed,
+                                                 None, # params,
+                                                 0, # key,
+                                                 None, # make_cutouts,
+                                                 None, # make_cutouts_style,
+                                                 None, # cut_batches,
+                                                 ), out_axes=0, static_broadcasted_argnums=(6,7,8),
                         devices=jax.devices()[1:])
 
 print('Loading CLIP model...')
@@ -294,12 +303,20 @@ def emb_image(image, clip_params=None):
 def cosim(a, b):
     return (txt(a) * txt(b)).sum(-1)
 
-title = ['clockwork demon of consciousness. trending on ArtStation']
-prompt = [txt(t) for t in title]
+def average(*xs):
+    total = 0
+    count = 0
+    for x in xs:
+        total += x
+        count += 1
+    return total / count
+
+title = ['curse breaker | trending on ArtStation']
+prompt = [txt('curse breaker | trending on ArtStation')]
 style_embed = norm1(jnp.array(cborfile('data/openimages_512x_png_embed224.cbor'))) - norm1(jnp.array(cborfile('data/imagenet_512x_jpg_embed224.cbor')))
 batch_size = 7
 
-clip_guidance_scale = 1000
+clip_guidance_scale = 2000
 style_guidance_scale = 300
 tv_scale = 150
 sat_scale = 600
@@ -309,10 +326,10 @@ cut_pow = 0.5
 cut_batches = 16
 style_cutn = 32
 
-n_batches = len(title)
+n_batches = len(title) * 5
 init_image = None #'https://zlkj.in/dalle/generated/2bcef7cbfa690a06a77acca7ac209718.png'
 skip_timesteps = 0
-seed = 17
+seed = 28
 
 # Actually do the run
 
@@ -357,8 +374,8 @@ def run():
         # x : [n, c, h, w]
         n = x.shape[0]
         # Triggers recompilation if cutout parameters have changed (cutn or cut_pow).
-        grad = base_cond_fn(x.unsqueeze(1), jnp.array(t).unsqueeze(1), jnp.array(cur_t),
-                            (text_embed, style_embed, model_params, clip_params, clip_guidance_scale, style_guidance_scale, tv_scale, sat_scale),
+        grad = base_cond_fn(x.unsqueeze(1), jnp.array(t).unsqueeze(1), jnp.array(cur_t), text_embed,
+                            (style_embed, model_params, clip_params, clip_guidance_scale, style_guidance_scale, tv_scale, sat_scale),
                             jnp.stack([rng.split() for _ in range(n)]),
                             make_cutouts,
                             make_cutouts_style,
@@ -367,7 +384,7 @@ def run():
         grad = grad.squeeze(1)
         # grad : [n, c, h, w]
         magnitude = grad.square().mean(axis=(1,2,3), keepdims=True).sqrt()
-        grad = grad / magnitude * magnitude.clamp(max=0.1)
+        grad = grad / magnitude * magnitude.clamp(max=0.2)
         return grad
 
     for i in range(n_batches):
@@ -379,6 +396,13 @@ def run():
         else:
           text_embed = prompt
           this_title = title
+
+        text_embed = text_embed.broadcast_to([batch_size, 512])
+        text_embed = norm1(text_embed + jax.random.normal(rng.split(), [batch_size, 512]) / math.sqrt(1000.0 * 512))
+
+        with open('text_embeds.txt', 'w') as fp:
+            print(title, file=fp)
+            print(text_embed.tolist(), file=fp)
 
         cur_t = diffusion.num_timesteps - skip_timesteps - 1
 
@@ -420,7 +444,7 @@ def run():
               fp.write(data)
 
 
-# run()
+run()
 
 
 class FIFOLock(object):
@@ -473,6 +497,7 @@ def handler(ui):
                         globals()['skip_timesteps'] = 0
                     globals()['seed'] = int(params['seed'])
                     globals()['cut_batches'] = int(params.get('cut_batches', 4))
+                    globals()['n_batches'] = 1
                     run()
                 self.send_response(200)
                 self.end_headers()
@@ -489,6 +514,7 @@ class UiServer(object):
 def run_server():
     try:
         server = UiServer()
+        print('Ready to accept requests!', file=sys.stderr)
         server.thread.join()
     except KeyboardInterrupt:
         exit()
