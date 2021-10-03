@@ -313,6 +313,21 @@ seed = 17
 # Actually do the run
 
 def proc_init_image(init_image):
+    if init_image.endswith(':parts512'):
+        url = init_image.rsplit(':', 1)[0]
+        init = Image.open(fetch(url)).convert('RGB')
+        # init = init.resize((model_config['image_size'], model_config['image_size']), Image.LANCZOS)
+        init = pil_to_tensor(init).mul(2).sub(1)
+        [c, h, w] = init.shape
+        indices = [(x, y)
+                   for y in range(0, h, 512)
+                   for x in range(0, w, 512)]
+        indices = (indices * batch_size)[:batch_size]
+        parts = [init[:, y:y+512, x:x+512] for (x, y) in indices]
+        init = jnp.stack(parts)
+        init = jax.image.resize(init, [batch_size, c, model_config['image_size'], model_config['image_size']], method='lanczos3')
+        return init
+
     init = Image.open(fetch(init_image)).convert('RGB')
     init = init.resize((model_config['image_size'], model_config['image_size']), Image.LANCZOS)
     init = pil_to_tensor(init).unsqueeze(0).mul(2).sub(1)
