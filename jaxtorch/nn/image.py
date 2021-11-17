@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 import jaxtorch
-from jaxtorch.core import Module, PRNG, Context, ParamState
+from jaxtorch.core import Module
 from jaxtorch import init
 
 class Upsample2d(Module):

@@ -19,18 +19,16 @@ def _addindent(s_, numSpaces):
 
 class Param(object):
     """Represents a parameter of a Module, and specifies its shape and initialization."""
-    def __init__(self, initializer, desc=None):
+    def __init__(self, shape, initializer):
+        self.shape = shape
         self.initializer = initializer
-        self.desc = desc
         self.name = None
 
     def __repr__(self):
         if self.name is not None:
-            return f'Param({self.name})'
-        elif self.desc:
-            return self.desc
+            return f'<Param at {self.name}>'
         else:
-            return f'Param({self.initializer})'
+            return super().__repr__()
 
 class PRNG(object):
     """Just a stateful wrapper for a jax.random.PRNGKey."""
@@ -39,48 +37,6 @@ class PRNG(object):
     def split(self):
         (self.key, subkey) = jax.random.split(self.key)
         return subkey
-
-class ParamState(object):
-    """Just a dictionary of tensors identified by Param."""
-    def __init__(self, values=None):
-        if values is None:
-            values = {}
-        self.values = values
-
-    def clone(self):
-        return ParamState(dict(self.values))
-
-    def merge(self, other):
-        """Returns the right-biased union of two dictionaries."""
-        px = self.clone()
-        px.values.update(other.values)
-        return px
-
-    def __getitem__(self, par):
-        if isinstance(par, Param):
-            return self.values[par]
-        else:
-            raise TypeError('Expected a Param for indexing into ParamState')
-
-    def __setitem__(self, par, v):
-        if isinstance(par, Param):
-            self.values[par] = v
-        else:
-            raise TypeError('Expected a Param for indexing into ParamState')
-
-    @staticmethod
-    def flatten(px):
-        return ([{id(par): val for (par, val) in px.values.items()}], set(px.values.keys()))
-
-    @staticmethod
-    def unflatten(aux, values):
-        return ParamState({par : values[0][id(par)] for par in aux})
-
-jax.tree_util.register_pytree_node(
-    ParamState,
-    ParamState.flatten,
-    ParamState.unflatten,
-)
 
 class ContextRandom(object):
     """Lives inside a Context and provides convenience functions for
@@ -121,7 +77,7 @@ random number generation that use the Context's stateful PRNG.
 
 @jax.tree_util.register_pytree_node_class
 class Context(object):
-    """Wraps a ParamState and a PRNG."""
+    """Wraps a parameter dictionary and a PRNG."""
     def __init__(self, px, key, mode='train'):
         self.px = px
         self.rng = PRNG(key)
@@ -138,12 +94,19 @@ class Context(object):
 
     def __getitem__(self, par):
         if isinstance(par, Param):
+            return self.px[par.name]
+        elif isinstance(par, str):
             return self.px[par]
         else:
             raise TypeError('Expected a Param for indexing into Context')
 
-    def __setitem__(self, par, tensor):
-        self.px[par] = tensor
+    def __setitem__(self, par, value):
+        if isinstance(par, Param):
+            self.px[par.name] = value
+        elif isinstance(par, str):
+            self.px[par] = value
+        else:
+            raise TypeError('Expected a Param for indexing into Context')
 
     def tree_flatten(self):
         return (self.px, self.rng.split()), (self.mode,)
@@ -160,7 +123,7 @@ class Module(object):
         return self.forward(cx, *args, **kwargs)
 
     def forward(self, cx: Context, *args, **kwargs):
-        """Implements the forward pass. Must take cx as the first argument."""
+        """Implements the forward pass. Must take Context as the first argument."""
         raise NotImplementedError
 
     def self_named_modules(self):
@@ -192,7 +155,12 @@ class Module(object):
                 cx[par] = par.initializer(cx.rng.split())
 
     def init_weights(self, key):
-        cx = Context(ParamState(), key)
+        """Attaches names to parameters and returns initialized dict of
+           parameters by name.
+
+        """
+        self.labeled_parameters_()
+        cx = Context({}, key)
         for module in self.gen_postorder_modules():
             module.self_init_weights(cx)
         self.self_init_weights(cx)
@@ -232,15 +200,12 @@ class Module(object):
     def parameters(self):
         return [p for (k, p) in self.gen_named_parameters()]
 
-    def state_dict(self, px: ParamState):
-        """Return all parameters of this module indexed by full names."""
-        state = {}
-        for (k, p) in self.gen_named_parameters():
-            state[k] = px[p]
-        return state
+    def state_dict(self, px):
+        return dict(px)
 
-    def load_state_dict(self, px: ParamState, state, strict=True):
-        """Load a previously saved state_dict into px. Modifies px."""
+    def load_state_dict(self, px, state, strict=True):
+        """Load a previously saved state_dict into px. Returns a new copy of px."""
+        px = dict(px)
         for (k, p) in self.gen_named_parameters():
             if k not in state:
                 if strict:
@@ -249,7 +214,7 @@ class Module(object):
                     print(f'Not loading missing parameter: {k}', file=sys.stderr)
                     continue
 
-            if px[p].shape != state[k].shape:
+            if px[p.name].shape != state[k].shape:
                 msg = f'Not loading parameter from incompatible shape: {k} ({px[p].shape} vs {state[k].shape})'
                 if strict:
                     raise ValueError(msg)
@@ -257,7 +222,8 @@ class Module(object):
                     print(msg, file=sys.stderr)
                     continue
 
-            px[p] = jax.numpy.asarray(state[k])
+            px[p.name] = jax.numpy.asarray(state[k])
+        return px
 
     def _get_name(self):
         return self.__class__.__name__

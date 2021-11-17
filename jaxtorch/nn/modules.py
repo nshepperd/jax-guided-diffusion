@@ -2,7 +2,7 @@ import math
 import jax
 import jax.numpy as jnp
 import jaxtorch
-from jaxtorch.core import Module, PRNG, Context, ParamState
+from jaxtorch.core import Module, PRNG, Context
 from jaxtorch import init
 
 class Identity(Module):
