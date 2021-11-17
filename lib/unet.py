@@ -144,16 +144,17 @@ class ResBlock(TimestepBlock):
     """
 
     def __init__(
-        self,
-        channels,
-        emb_channels,
-        dropout,
-        out_channels=None,
-        use_conv=False,
-        use_scale_shift_norm=False,
-        dims=2,
-        up=False,
-        down=False,
+            self,
+            channels,
+            emb_channels,
+            dropout,
+            out_channels=None,
+            use_conv=False,
+            use_scale_shift_norm=False,
+            dims=2,
+            up=False,
+            down=False,
+            use_checkpoint=False,
     ):
         super().__init__()
         self.channels = channels
@@ -205,6 +206,9 @@ class ResBlock(TimestepBlock):
         else:
             self.skip_connection = nn.Conv2d(channels, self.out_channels, 1)
 
+        if use_checkpoint:
+            self.forward = jax.checkpoint(self.forward)
+
     def forward(self, cx, x, emb):
         if self.updown:
             in_rest = nn.Sequential(*self.in_layers.modules[:-1])
@@ -237,11 +241,12 @@ class AttentionBlock(nn.Module):
     """
 
     def __init__(
-        self,
-        channels,
-        num_heads=1,
-        num_head_channels=-1,
-        use_new_attention_order=False,
+            self,
+            channels,
+            num_heads=1,
+            num_head_channels=-1,
+            use_new_attention_order=False,
+            use_checkpoint=False,
     ):
         super().__init__()
         self.channels = channels
@@ -262,6 +267,9 @@ class AttentionBlock(nn.Module):
             self.attention = QKVAttentionLegacy(self.num_heads)
 
         self.proj_out = nn.Conv1d(channels, channels, 1, zero_init=True)
+
+        if use_checkpoint:
+            self.forward = jax.checkpoint(self.forward)
 
     def forward(self, cx, x):
         b, c, *spatial = x.shape
@@ -390,6 +398,7 @@ class UNetModel(nn.Module):
                         out_channels=int(mult * model_channels),
                         dims=dims,
                         use_scale_shift_norm=use_scale_shift_norm,
+                        use_checkpoint=use_checkpoint,
                     )
                 ]
                 ch = int(mult * model_channels)
@@ -400,6 +409,7 @@ class UNetModel(nn.Module):
                             num_heads=num_heads,
                             num_head_channels=num_head_channels,
                             use_new_attention_order=use_new_attention_order,
+                            use_checkpoint=use_checkpoint,
                         )
                     )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
@@ -417,6 +427,7 @@ class UNetModel(nn.Module):
                             dims=dims,
                             use_scale_shift_norm=use_scale_shift_norm,
                             down=True,
+                            use_checkpoint=use_checkpoint,
                         )
                         if resblock_updown
                         else Downsample2D(
@@ -436,12 +447,14 @@ class UNetModel(nn.Module):
                 dropout,
                 dims=dims,
                 use_scale_shift_norm=use_scale_shift_norm,
+                use_checkpoint=use_checkpoint,
             ),
             AttentionBlock(
                 ch,
                 num_heads=num_heads,
                 num_head_channels=num_head_channels,
                 use_new_attention_order=use_new_attention_order,
+                use_checkpoint=use_checkpoint,
             ),
             ResBlock(
                 ch,
@@ -449,6 +462,7 @@ class UNetModel(nn.Module):
                 dropout,
                 dims=dims,
                 use_scale_shift_norm=use_scale_shift_norm,
+                use_checkpoint=use_checkpoint,
             ),
         )
         self._feature_size += ch
@@ -465,6 +479,7 @@ class UNetModel(nn.Module):
                         out_channels=int(model_channels * mult),
                         dims=dims,
                         use_scale_shift_norm=use_scale_shift_norm,
+                        use_checkpoint=use_checkpoint,
                     )
                 ]
                 ch = int(model_channels * mult)
@@ -475,6 +490,7 @@ class UNetModel(nn.Module):
                             num_heads=num_heads_upsample,
                             num_head_channels=num_head_channels,
                             use_new_attention_order=use_new_attention_order,
+                            use_checkpoint=use_checkpoint,
                         )
                     )
                 if level and i == num_res_blocks:
@@ -488,6 +504,7 @@ class UNetModel(nn.Module):
                             dims=dims,
                             use_scale_shift_norm=use_scale_shift_norm,
                             up=True,
+                            use_checkpoint=use_checkpoint,
                         )
                         if resblock_updown
                         else Upsample2D(ch, conv_resample, out_channels=out_ch)

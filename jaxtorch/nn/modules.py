@@ -1,11 +1,9 @@
+import math
 import jax
 import jax.numpy as jnp
 import jaxtorch
 from jaxtorch.core import Module, PRNG, Context, ParamState
 from jaxtorch import init
-
-def square(x):
-    return x**2
 
 class Identity(Module):
     def forward(self, cx, x):
@@ -32,16 +30,9 @@ class ModuleList(Module):
     def forward(self, cx, x):
         raise NotImplementedError
 
-    def gen_named_modules(self):
+    def self_named_modules(self):
         for (i, m) in enumerate(self.modules):
             yield (f'{i}', m)
-            for (k, p) in m.gen_named_modules():
-                yield (f'{i}.{k}', p)
-
-    def gen_named_parameters(self):
-        for (i, m) in enumerate(self.modules):
-            for (k, p) in m.gen_named_parameters():
-                yield (f'{i}.{k}', p)
 
 
 class Sequential(ModuleList):
@@ -50,18 +41,17 @@ class Sequential(ModuleList):
             x = module(cx, x)
         return x
 
+
 class Linear(Module):
-    def __init__(self, c1, c2, bias=True):
-        self.c1 = c1
-        self.c2 = c2
-        self.weight = init.glorot_normal(c2, c1)
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = init.glorot_normal(out_features, in_features)
         if bias:
-            self.bias = init.zeros(c2)
+            self.bias = init.zeros(out_features)
         else:
             self.bias = None
-
-    def __repr__(self):
-        return f'Linear({self.c1}, {self.c2})'
 
     def forward(self, cx, x):
         y = x @ jnp.transpose(cx[self.weight])
@@ -69,17 +59,36 @@ class Linear(Module):
             y = y + cx[self.bias]
         return y
 
-class Embedding(Module):
-    def __init__(self, n, c):
-        self.n = n
-        self.c = c
-        self.weight = init.normal(n, c)
+    def extra_repr(self) -> str:
+        return 'in_features={}, out_features={}, bias={}'.format(
+            self.in_features, self.out_features, self.bias is not None
+        )
 
-    def __repr__(self):
-        return f'Embedding({self.n}, {self.c})'
+
+class Embedding(Module):
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.weight = init.normal(num_embeddings, embedding_dim)
 
     def forward(self, cx, x):
         return cx[self.weight][x]
+
+    def extra_repr(self) -> str:
+        s = '{num_embeddings}, {embedding_dim}'
+        # if self.padding_idx is not None:
+        #     s += ', padding_idx={padding_idx}'
+        # if self.max_norm is not None:
+        #     s += ', max_norm={max_norm}'
+        # if self.norm_type != 2:
+        #     s += ', norm_type={norm_type}'
+        # if self.scale_grad_by_freq is not False:
+        #     s += ', scale_grad_by_freq={scale_grad_by_freq}'
+        # if self.sparse is not False:
+        #     s += ', sparse=True'
+        return s.format(**self.__dict__)
+
 
 
 class Tanh(Module):
@@ -92,15 +101,37 @@ class Dropout(Module):
         self.rate = p
 
     def forward(self, cx, x):
-        if self.rate == 0.0 or getattr(cx, 'mode', None)=='eval':
+        if cx.mode == 'eval':
             return x
-        key = cx.rng.split()
-        p = jax.random.bernoulli(key, 1.0 - self.rate, shape=x.shape)
-        return x * p / (1.0 - self.rate)
+        mask = cx.random.bernoulli(1.0 - self.rate, shape=x.shape)
+        return x * mask / (1.0 - self.rate)
+
+class Dropout2d(Module):
+    def __init__(self, p=0.5):
+        self.rate = p
+
+    def forward(self, cx, x):
+        if cx.mode == 'eval':
+            return x
+        drop_shape = x.shape[:2] + (1,) * len(x.shape[2:])
+        mask = cx.random.bernoulli(1.0 - self.rate, shape=drop_shape)
+        return x * mask / (1.0 - self.rate)
 
 class GELU(Module):
     def forward(self, cx, x):
         return jax.nn.gelu(x)
+
+class ReLU(Module):
+    def forward(self, cx, x):
+        return jax.nn.relu(x)
+
+class LeakyReLU(Module):
+    def __init__(self, negative_slope=0.01):
+        self.negative_slope = negative_slope
+
+    def forward(self, cx, x):
+        return jax.nn.leaky_relu(x, self.negative_slope)
+
 
 class LayerNorm(Module):
     def __init__(self, *normalized_shape):
@@ -111,7 +142,7 @@ class LayerNorm(Module):
 
     def forward(self, cx, x):
         mu = x.mean(axis=self.axes, keepdims=True)
-        sigma = jnp.sqrt(square(x - mu).mean(axis=self.axes, keepdims=True))
+        sigma = jnp.sqrt((x - mu).square().mean(axis=self.axes, keepdims=True))
         normed = (x - mu) / sigma
         return cx[self.weight] * normed + cx[self.bias]
 
@@ -147,7 +178,7 @@ class Conv2d(Module):
         self.padding = padding
         self.dilation = dilation
         self.groups = groups
-        self.weight = init.glorot_normal(out_channels, in_channels//groups, kernel_size, kernel_size)
+        self.weight = init.kaiming_uniform(out_channels, in_channels//groups, kernel_size, kernel_size, a=math.sqrt(5.0))
         if zero_init:
             self.weight = init.zeros(out_channels, in_channels//groups, kernel_size, kernel_size)
         self.use_bias = bias

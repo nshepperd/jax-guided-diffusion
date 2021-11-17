@@ -316,6 +316,7 @@ prompt = [txt('curse breaker | trending on ArtStation')]
 style_embed = norm1(jnp.array(cborfile('data/openimages_512x_png_embed224.cbor'))) - norm1(jnp.array(cborfile('data/imagenet_512x_jpg_embed224.cbor')))
 batch_size = 7
 
+prompt_jitter_scale = 500
 clip_guidance_scale = 2000
 style_guidance_scale = 300
 tv_scale = 150
@@ -329,7 +330,7 @@ style_cutn = 32
 n_batches = len(title) * 5
 init_image = None #'https://zlkj.in/dalle/generated/2bcef7cbfa690a06a77acca7ac209718.png'
 skip_timesteps = 0
-seed = 28
+seed = 30
 
 # Actually do the run
 
@@ -397,8 +398,9 @@ def run():
           text_embed = prompt
           this_title = title
 
+        # Apply jitter
         text_embed = text_embed.broadcast_to([batch_size, 512])
-        text_embed = norm1(text_embed + jax.random.normal(rng.split(), [batch_size, 512]) / math.sqrt(1000.0 * 512))
+        text_embed = norm1(text_embed + jax.random.normal(rng.split(), [batch_size, 512]) / math.sqrt(prompt_jitter_scale * 512.0))
 
         with open('text_embeds.txt', 'w') as fp:
             print(title, file=fp)
