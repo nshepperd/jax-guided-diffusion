@@ -32,7 +32,7 @@ register(
     arccos = jnp.arccos,
     log = jnp.log,
     exp = jnp.exp,
-    clamp = lambda a, minval, maxval: jnp.clip(a, a_min=minval, a_max=maxval),
+    clamp = lambda a, minval=None, maxval=None: jnp.clip(a, a_min=minval, a_max=maxval),
     unsqueeze = lambda arr, axis=0: jnp.expand_dims(arr, axis),
     rearrange = rearrange,
     broadcast_to = jnp.broadcast_to,

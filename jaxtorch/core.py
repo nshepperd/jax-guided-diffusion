@@ -197,6 +197,9 @@ class Module(object):
     def named_parameters(self):
         return list(self.gen_named_parameters())
 
+    def modules(self):
+        return [m for (k, m) in self.gen_named_modules()]
+
     def parameters(self):
         return [p for (k, p) in self.gen_named_parameters()]
 
@@ -215,7 +218,7 @@ class Module(object):
                     continue
 
             if px[p.name].shape != state[k].shape:
-                msg = f'Not loading parameter from incompatible shape: {k} ({px[p].shape} vs {state[k].shape})'
+                msg = f'Not loading parameter from incompatible shape: {k} ({px[p.name].shape} vs {state[k].shape})'
                 if strict:
                     raise ValueError(msg)
                 else:

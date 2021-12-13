@@ -2,6 +2,7 @@ import math
 import jax
 import jax.numpy as jnp
 import jaxtorch
+import numbers
 from jaxtorch.core import Module, PRNG, Context
 from jaxtorch import init
 
@@ -134,15 +135,23 @@ class LeakyReLU(Module):
 
 
 class LayerNorm(Module):
-    def __init__(self, *normalized_shape):
-        self.normalized_shape = normalized_shape
-        self.weight = init.ones(*normalized_shape)
-        self.bias = init.zeros(*normalized_shape)
+    def __init__(self, normalized_shape, eps=1e-05, elementwise_affine=True):
+        if isinstance(normalized_shape, numbers.Integral):
+            normalized_shape = (normalized_shape,)
+        self.normalized_shape = tuple(normalized_shape)
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        if elementwise_affine:
+            self.weight = init.ones(*normalized_shape)
+            self.bias = init.zeros(*normalized_shape)
+        else:
+            self.weight = None
+            self.bias = None
         self.axes = tuple(-i for i in range(1, len(normalized_shape)+1))
 
     def forward(self, cx, x):
         mu = x.mean(axis=self.axes, keepdims=True)
-        sigma = jnp.sqrt((x - mu).square().mean(axis=self.axes, keepdims=True))
+        sigma = jnp.sqrt((x - mu).square().mean(axis=self.axes, keepdims=True) + self.eps)
         normed = (x - mu) / sigma
         return cx[self.weight] * normed + cx[self.bias]
 
@@ -227,3 +236,15 @@ class GroupNorm(Module):
             bias = cx[self.bias].reshape(broadcast_shape)
             y = y * weight + bias
         return y
+
+class PixelUnshuffle(Module):
+    def __init__(self, downscale_factor):
+        self.downscale_factor = downscale_factor
+    def forward(self, cx, x):
+        return x.rearrange('... c (h r) (w s) -> ... (c r s) h w', r = self.downscale_factor, s = self.downscale_factor)
+
+class PixelShuffle(Module):
+    def __init__(self, upscale_factor):
+        self.upscale_factor = upscale_factor
+    def forward(self, cx, x):
+        return x.rearrange('... (c r s) h w -> ... c (h r) (w s)', r = self.upscale_factor, s = self.upscale_factor)
