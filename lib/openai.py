@@ -51,8 +51,8 @@ OPENAI_256_CONFIG = {
     'use_new_attention_order': False
 }
 
-def create_openai_256_model(use_checkpoint=False):
-    return partial(UNetModel, **OPENAI_256_CONFIG)(use_checkpoint=use_checkpoint)
+def create_openai_256_model(use_checkpoint=False, **kwargs):
+    return partial(UNetModel, **OPENAI_256_CONFIG)(use_checkpoint=use_checkpoint, **kwargs)
 
-def create_openai_512_model(use_checkpoint=False):
-    return partial(UNetModel, **OPENAI_512_CONFIG)(use_checkpoint=use_checkpoint)
+def create_openai_512_model(use_checkpoint=False, **kwargs):
+    return partial(UNetModel, **OPENAI_512_CONFIG)(use_checkpoint=use_checkpoint, **kwargs)
