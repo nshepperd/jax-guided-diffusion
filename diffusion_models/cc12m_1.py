@@ -241,3 +241,11 @@ def cc12m_1_cfg_wrap(params, x, cosine_t, key, clip_embed=None, cfg_guidance_sca
     cx = Context(params, key).eval_mode_()
     return (cc12m_1_model(cx, x, cosine_t.broadcast_to([n]), clip_embed) * cfg_guidance_scale +
             cc12m_1_model(cx, x, cosine_t.broadcast_to([n]), 0*clip_embed) * (1.0-cfg_guidance_scale))
+
+@make_partial
+@jax.jit
+def cc12m_1_classifier_wrap(params, x, cosine_t, key, clip_embed=None, cfg_guidance_scale=1.0):
+    [n, c, h, w] = x.shape
+    cx = Context(params, key).eval_mode_()
+    return (cc12m_1_model(cx, x, cosine_t.broadcast_to([n]), clip_embed) * cfg_guidance_scale +
+            cc12m_1_model(cx, x, cosine_t.broadcast_to([n]), 0*clip_embed) * (-cfg_guidance_scale))

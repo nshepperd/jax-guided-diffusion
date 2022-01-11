@@ -247,6 +247,24 @@ class MakeCutouts(object):
         (p_grey, cut_pow, p_mixgrey) = dynamic
         return MakeCutouts(cut_size, cutn, cut_pow, p_grey, p_mixgrey)
 
+@jax.tree_util.register_pytree_node_class
+class MakeCutoutsPixelated(object):
+    def __init__(self, make_cutouts, factor=4):
+        self.make_cutouts = make_cutouts
+        self.factor = factor
+        self.cutn = make_cutouts.cutn
+
+    def __call__(self, input, key):
+        [n, c, h, w] = input.shape
+        input = jax.image.resize(input, [n, c, h*self.factor, w * self.factor], method='nearest')
+        return self.make_cutouts(input, key)
+
+    def tree_flatten(self):
+        return ([self.make_cutouts], [self.factor])
+    @staticmethod
+    def tree_unflatten(static, dynamic):
+        return MakeCutoutsPixelated(*dynamic, *static)
+
 def spherical_dist_loss(x, y):
     x = norm1(x)
     y = norm1(y)
@@ -390,24 +408,6 @@ pixelartv7_ic_attn_params = LazyParams.pt(
     , key='params_ema'
 )
 
-@jax.tree_util.register_pytree_node_class
-class MakeCutoutsPixelated(object):
-    def __init__(self, make_cutouts, factor=4):
-        self.make_cutouts = make_cutouts
-        self.factor = factor
-        self.cutn = make_cutouts.cutn
-
-    def __call__(self, input, key):
-        [n, c, h, w] = input.shape
-        input = jax.image.resize(input, [n, c, h*self.factor, w * self.factor], method='nearest')
-        return self.make_cutouts(input, key)
-
-    def tree_flatten(self):
-        return ([self.make_cutouts], [self.factor])
-    @staticmethod
-    def tree_unflatten(static, dynamic):
-        return MakeCutoutsPixelated(*dynamic, *static)
-
 # Kat models
 
 danbooru_128_model = v_diffusion.get_model('danbooru_128')
@@ -459,6 +459,8 @@ def exec_aesthetic_model(params, embed):
   return jax.nn.log_softmax(aesthetic_model(Context(params, None), embed), axis=-1)
 exec_aesthetic_model = Partial(exec_aesthetic_model, aesthetic_model_params)
 
+# Losses and cond fn.
+
 @make_partial
 @apply_partial(exec_aesthetic_model)
 def AestheticLoss(exec_aesthetic_model, target, scale, image_embeds):
@@ -473,8 +475,6 @@ def AestheticExpected(exec_aesthetic_model, scale, image_embeds):
     probs = jax.nn.softmax(exec_aesthetic_model(image_embeds))
     expected = (probs * (1 + jnp.arange(10))).sum(-1)
     return -(scale * expected.mean(0)).sum()
-
-# Losses and cond fn.
 
 @jax.tree_util.register_pytree_node_class
 class CondCLIP(object):
