@@ -55,6 +55,24 @@ class DDPM(NoiseSchedule):
     def from_cosine(self, t):
         return cosine_t_to_ddpm(t, self.initial_snr)
 
+class LinearLogSnr(NoiseSchedule):
+    def __init__(self, initial_snr=10.0, final_snr=-10):
+        self.initial_snr = initial_snr
+        self.final_snr = final_snr
+    def to_cosine(self, t):
+        alpha, sigma = self.to_alpha_sigma(t)
+        return jnp.arctan2(sigma, alpha) * 2 / math.pi
+    def to_alpha_sigma(self, t):
+        log_snrs = self.initial_snr * (1-t) + self.final_snr * t
+        alphas_squared = jax.nn.sigmoid(log_snrs)
+        sigmas_squared = jax.nn.sigmoid(-log_snrs)
+        return alphas_squared.sqrt(), sigmas_squared.sqrt()
+    def from_cosine(self, t):
+        alpha, sigma = cosine.to_alpha_sigma(t)
+        log_snr = jnp.log(alpha**2 / sigma**2)
+        ct = (log_snr - self.initial_snr) / (self.final_snr - self.initial_snr)
+        return ct.clamp(0,1)
+
 class Spliced(NoiseSchedule):
     # Fixed to initial_snr=10 for now.
     def to_cosine(self, t):

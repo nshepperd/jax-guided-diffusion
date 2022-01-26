@@ -23,7 +23,7 @@ class Perceptor(object):
     def embed_text(self, text):
         tokens = clip_jax.tokenize([text])
         text_embed = self.text_fn(self.clip_params, tokens)
-        return norm1(text_embed.reshape(512))
+        return norm1(text_embed.squeeze(0))
     def embed_texts(self, texts):
         return jnp.stack([self.embed_text(t) for t in texts])
     def tree_flatten(self):
@@ -41,3 +41,8 @@ image_fn, text_fn, clip_params, _ = clip_jax.load('ViT-B/32')
 vit32 = Perceptor(image_fn, text_fn, clip_params)
 image_fn, text_fn, clip_params, _ = clip_jax.load('ViT-B/16')
 vit16 = Perceptor(image_fn, text_fn, clip_params)
+
+def get_vitl14():
+    image_fn, text_fn, clip_params, _ = clip_jax.load('ViT-L/14')
+    vitl14 = Perceptor(image_fn, text_fn, clip_params)
+    return vitl14

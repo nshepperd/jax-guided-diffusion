@@ -101,6 +101,7 @@ from diffusion_models.secondary import secondary1_wrap, secondary2_wrap
 from diffusion_models.antijpeg import jpeg_wrap, jpeg_classifier_wrap
 from diffusion_models.pixelart import pixelartv4_wrap, pixelartv6_wrap
 from diffusion_models.pixelartv7 import pixelartv7_ic_wrap, pixelartv7_ic_attn_wrap
+from diffusion_models.pixelartv7grid import pixelartv7_ic_attn_grid_wrap2
 from diffusion_models.cc12m_1 import cc12m_1_wrap, cc12m_1_cfg_wrap
 from diffusion_models.openai import make_openai_model, make_openai_finetune_model
 
@@ -293,10 +294,11 @@ class LerpModels(object):
     def __init__(self, models):
         self.models = models
     def __call__(self, x, t, key):
-        outputs = [m(x,t,key) for (m,w) in self.models]
-        v = sum(out.v * w for (out, (m,w)) in zip(outputs, self.models))
-        pred = sum(out.pred * w for (out, (m,w)) in zip(outputs, self.models))
-        eps = sum(out.eps * w for (out, (m,w)) in zip(outputs, self.models))
+        n = x.shape[0]
+        outputs = [(m(x,t,key), w.broadcast_to([n])[:,None,None,None]) for (m,w) in self.models]
+        v = sum(out.v * w for (out, w) in outputs)
+        pred = sum(out.pred * w for (out, w) in outputs)
+        eps = sum(out.eps * w for (out, w) in outputs)
         return DiffusionOutput(v, pred, eps)
     def tree_flatten(self):
         return [self.models], []
@@ -405,6 +407,12 @@ pixelartv7_ic_params = LazyParams.pt(
 pixelartv7_ic_attn_params = LazyParams.pt(
     # 'https://set.zlkj.in/models/diffusion/pixelart/pixelart-v6-ic-1400.pt'
     'https://set.zlkj.in/models/diffusion/pixelart/pixelart-v7-large-ic-attn-600.pt'
+    , key='params_ema'
+)
+
+pixelartv7_ic_attn_grid_params = LazyParams.pt(
+    # 'https://set.zlkj.in/models/diffusion/pixelart/pixelart-v6-ic-1400.pt'
+    'https://set.zlkj.in/models/diffusion/pixelart/pixelart-v7-large-ic-attn-grid-1000.pt'
     , key='params_ema'
 )
 
@@ -704,18 +712,25 @@ def process_prompt(clip, prompt):
 def process_prompts(clip, prompts):
   return jnp.stack([process_prompt(clip, prompt) for prompt in prompts])
 
+def mkgrid(n, h, w):
+    return jnp.concatenate([
+      jnp.linspace(-1, 1, h)[None,:,None].broadcast_to([n, 1, h, w]),
+      jnp.linspace(-1, 1, w)[None,None,:].broadcast_to([n, 1, h, w])], axis=1)
+
+
 """Configuration for the run"""
 
-seed = None # if None, uses the current time in seconds.
-image_size = (128, 128)
-batch_size = 4
+seed = 123 # if None, uses the current time in seconds.
+image_size = (256, 256)
+batch_size = 2
 n_batches = 1
-use_model = 'pixelartv4'
+use_model = 'pixelartv7_ic_attn_grid'
 
 def expand(xs):
   return (xs * batch_size)[:batch_size]
 
-all_title = 'a cute girl levitating a slice of pizza with her mind #pixelart'
+# all_title = 'a cute girl levitating a slice of pizza with her mind #pixelart'
+all_title = 'concept art of a vaporwave rifle by steven belledin #pixelart'
 title = expand([all_title])
 
 # all_title = 'concept art of the mirror dimension by steven belledin #pixelart'
@@ -726,8 +741,10 @@ title = expand([all_title])
 # title = [all_title] * batch_size
 
 
+grid_guidance_scale = jnp.array(10.0)
+
 cfg_guidance_scale = 2.0
-ic_cond = 'https://cdn.discordapp.com/emojis/916943952597360690.png?size=240&quality=lossless'
+ic_cond = 'https://irc.zlkj.in/uploads/eebeaf1803e898ac/88552154_p0%20-%20Coral.png'
 # 'https://irc.zlkj.in/uploads/eebeaf1803e898ac/88552154_p0%20-%20Coral.png'
 # 'https://cdn.discordapp.com/emojis/916943952597360690.png?size=240&quality=lossless' # pizagal
 
@@ -822,6 +839,13 @@ def config():
             cond = jnp.array(TF.to_tensor(Image.open(fetch(ic_cond)).convert('RGB').resize(image_size,Image.BICUBIC))) * 2 - 1
             cond = cond.broadcast_to([batch_size, 3, image_size[1], image_size[0]])
             diffusion = pixelartv7_ic_attn_wrap(pixelartv7_ic_attn_params(), cond=cond, cfg_guidance_scale=cfg_guidance_scale)
+        elif use_model == 'pixelartv7_ic_attn_grid':
+            # -- pixel art model --
+            cond = jnp.array(TF.to_tensor(Image.open(fetch(ic_cond)).convert('RGB').resize(image_size,Image.BICUBIC))) * 2 - 1
+            cond = cond.broadcast_to([batch_size, 3, image_size[1], image_size[0]])
+            grid = mkgrid(batch_size, image_size[1], image_size[0])
+            diffusion = LerpModels([(pixelartv7_ic_attn_grid_wrap2(pixelartv7_ic_attn_grid_params(), cond=cond, grid=grid), grid_guidance_scale),
+                                    (pixelartv7_ic_attn_grid_wrap2(pixelartv7_ic_attn_grid_params(), cond=cond, grid=None), 1.0-grid_guidance_scale)])
         elif use_model == 'pixelartv6':
             diffusion = pixelartv6_wrap(pixelartv6_params())
         elif use_model == 'pixelartv4':
