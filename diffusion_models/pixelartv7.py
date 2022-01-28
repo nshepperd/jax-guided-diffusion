@@ -252,6 +252,13 @@ pixelartv7_ic_attn_model.labeled_parameters_()
 def pixelartv7_ic_attn_wrap(params, x, cosine_t, key, cond=None, cfg_guidance_scale=None):
     [n, c, h, w] = x.shape
     cx = Context(params, key).eval_mode_()
-    cond = jnp.concatenate([cond, jnp.ones([n, 1, h, w])], axis=1)
-    return (pixelartv7_ic_attn_model(cx, x, cosine_t.broadcast_to([n]), cond) * cfg_guidance_scale +
-            pixelartv7_ic_attn_model(cx, x, cosine_t.broadcast_to([n]), 0*cond) * (1.0-cfg_guidance_scale))
+    if cfg_guidance_scale is not None:
+        cond = jnp.concatenate([cond, jnp.ones([n, 1, h, w])], axis=1)
+        return (pixelartv7_ic_attn_model(cx, x, cosine_t.broadcast_to([n]), cond) * cfg_guidance_scale +
+                pixelartv7_ic_attn_model(cx, x, cosine_t.broadcast_to([n]), 0*cond) * (1.0-cfg_guidance_scale))
+    elif cond is not None:
+        cond = jnp.concatenate([cond, jnp.ones([n, 1, h, w])], axis=1)
+        return pixelartv7_ic_attn_model(cx, x, cosine_t.broadcast_to([n]), cond)
+    else:
+        cond = jnp.zeros([n, 4, h, w])
+        return pixelartv7_ic_attn_model(cx, x, cosine_t.broadcast_to([n]), cond)
