@@ -8,10 +8,10 @@ from tqdm import tqdm
 from diffusion_models.schedules import cosine
 
 def transfer(x, eps, t_1, t_2):
-    alphas, sigmas = cosine.to_alpha_sigma(t_1)
-    next_alphas, next_sigmas = cosine.to_alpha_sigma(t_2)
-    pred = (x - eps * sigmas) / alphas
-    x = pred * next_alphas + eps * next_sigmas
+    alpha1, sigma1 = cosine.to_alpha_sigma(t_1)
+    alpha2, sigma2 = cosine.to_alpha_sigma(t_2)
+    pred = (x - eps * sigma1) / alpha1
+    x = pred * alpha2 + eps * sigma2
     return x, pred
 
 def prk_step(model, x, t_1, t_2, key):
@@ -39,8 +39,12 @@ def prk_sample_loop(model, x, schedule, key):
     """Draws samples from a model given starting noise using Pseudo Runge-Kutta."""
     rng = PRNG(key)
     for i in tqdm(range(schedule.shape[0]-1)):
-        x, _, pred = prk_step(model, x, schedule[i], schedule[i + 1], rng.split())
+        y, _, pred = prk_step(model, x, schedule[i], schedule[i + 1], rng.split())
         yield i, x, pred
+        x = y
+    i = schedule.shape[0]-1
+    pred = model(x, schedule[i], rng.split()).pred
+    yield i, x, pred
 
 def plms_sample_loop(model, x, schedule, key):
     """Draws samples from a model given starting noise using Pseudo Linear Multistep."""
@@ -48,9 +52,13 @@ def plms_sample_loop(model, x, schedule, key):
     old_eps = []
     for i in tqdm(range(schedule.shape[0]-1)):
         if len(old_eps) < 3:
-            x, eps, pred = prk_step(model, x, schedule[i], schedule[i + 1], rng.split())
+            y, eps, pred = prk_step(model, x, schedule[i], schedule[i + 1], rng.split())
         else:
-            x, eps, pred = plms_step(model, x, old_eps, schedule[i], schedule[i + 1], rng.split())
+            y, eps, pred = plms_step(model, x, old_eps, schedule[i], schedule[i + 1], rng.split())
             old_eps.pop(0)
         old_eps.append(eps)
         yield i, x, pred
+        x = y
+    i = schedule.shape[0]-1
+    pred = model(x, schedule[i], rng.split()).pred
+    yield i, x, pred
