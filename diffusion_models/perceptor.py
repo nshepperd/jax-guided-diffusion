@@ -13,10 +13,11 @@ from diffusion_models.schedules import cosine
 @jax.tree_util.register_pytree_node_class
 class Perceptor(object):
     # Wraps a CLIP instance and its parameters.
-    def __init__(self, image_fn, text_fn, clip_params):
+    def __init__(self, image_fn, text_fn, clip_params, preprocess):
         self.image_fn = image_fn
         self.text_fn = text_fn
         self.clip_params = clip_params
+        self.preprocess = preprocess
     @jax.jit
     def embed_cutouts(self, cutouts):
         return norm1(self.image_fn(self.clip_params, cutouts))
@@ -26,23 +27,26 @@ class Perceptor(object):
         return norm1(text_embed.squeeze(0))
     def embed_texts(self, texts):
         return jnp.stack([self.embed_text(t) for t in texts])
+    def embed_image(self, init_pil):
+        image_embed = self.image_fn(self.clip_params, np.expand_dims(self.preprocess(init_pil), 0))
+        return image_embed
     def tree_flatten(self):
-        return [self.clip_params], [self.image_fn, self.text_fn]
+        return [self.clip_params], [self.image_fn, self.text_fn, self.preprocess]
     def tree_unflatten(static, dynamic):
         [clip_params] = dynamic
-        [image_fn, text_fn] = static
-        return Perceptor(image_fn, text_fn, clip_params)
+        [image_fn, text_fn, preprocess] = static
+        return Perceptor(image_fn, text_fn, clip_params, preprocess)
 
 clip_size = 224
 normalize = Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
                       std=[0.26862954, 0.26130258, 0.27577711])
 
-image_fn, text_fn, clip_params, _ = clip_jax.load('ViT-B/32')
-vit32 = Perceptor(image_fn, text_fn, clip_params)
-image_fn, text_fn, clip_params, _ = clip_jax.load('ViT-B/16')
-vit16 = Perceptor(image_fn, text_fn, clip_params)
+image_fn, text_fn, clip_params, preprocess = clip_jax.load('ViT-B/32')
+vit32 = Perceptor(image_fn, text_fn, clip_params, preprocess)
+image_fn, text_fn, clip_params, preprocess = clip_jax.load('ViT-B/16')
+vit16 = Perceptor(image_fn, text_fn, clip_params, preprocess)
 
 def get_vitl14():
-    image_fn, text_fn, clip_params, _ = clip_jax.load('ViT-L/14')
-    vitl14 = Perceptor(image_fn, text_fn, clip_params)
+    image_fn, text_fn, clip_params, preprocess = clip_jax.load('ViT-L/14')
+    vitl14 = Perceptor(image_fn, text_fn, clip_params, preprocess)
     return vitl14
