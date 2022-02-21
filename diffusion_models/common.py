@@ -98,12 +98,16 @@ def make_cosine_model(model):
 
 @jax.jit
 def blur_fft(image, std):
+  std = jnp.asarray(std).clamp(1e-18)
   [n, c, h, w] = image.shape
-  kernel_h = jnp.roll(jsp.stats.norm.pdf(jnp.linspace(-(h/2) / std, (h/2) / std, h)), -(h//2))
-  kernel_w = jnp.roll(jsp.stats.norm.pdf(jnp.linspace(-(w/2) / std, (w/2) / std, w)), -(w//2))
-  kernel = kernel_h[:, None] * kernel_w[None, :]
+  dy = jnp.arange(-(h-1)//2, (h+1)//2)
+  dy = jnp.roll(dy, -(h-1)//2)
+  dx = jnp.arange(-(w-1)//2, (w+1)//2)
+  dx = jnp.roll(dx, -(w-1)//2)
+  distance = dy[:, None]**2 + dx[None, :]**2
+  kernel = jnp.exp(-0.5 * distance / std**2)
   kernel /= kernel.sum()
-  return jnp.fft.irfft2(jnp.fft.rfft2(image, norm='forward') * jnp.fft.rfft2(kernel, norm='backward'), norm='forward')
+  return jnp.fft.ifft2(jnp.fft.fft2(image, norm='forward') * jnp.fft.fft2(kernel, norm='backward'), norm='forward').real
 
 def Normalize(mean, std):
     mean = jnp.array(mean).reshape(3,1,1)
