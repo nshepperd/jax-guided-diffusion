@@ -16,6 +16,7 @@ def register(**kwargs):
             print(f'Not monkeypatching DeviceArray and Tracer with `{attr}`, because that method is already implemented.', file=sys.stderr)
             continue
         setattr(jaxlib.xla_extension.DeviceArrayBase, attr, fun)
+        setattr(jax.interpreters.xla.DeviceArray, attr, fun)
         setattr(jax.core.Tracer, attr, fun)
 
 def broadcast_to(arr, shape):
