@@ -25,10 +25,7 @@ def conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
                                           lhs_dilation=None,
                                           rhs_dilation=dilation,
                                           dimension_numbers=('NCHW', 'OIHW', 'NCHW'),
-                                          feature_group_count=groups,
-                                          batch_group_count=1,
-                                          precision=None,
-                                          preferred_element_type=None)
+                                          feature_group_count=groups)
     if bias is not None:
         output = output + bias.reshape(bias.shape[0], 1, 1)
     return output
@@ -58,10 +55,7 @@ def conv1d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
                                           lhs_dilation=None,
                                           rhs_dilation=dilation,
                                           dimension_numbers=('NCH', 'OIH', 'NCH'),
-                                          feature_group_count=groups,
-                                          batch_group_count=1,
-                                          precision=None,
-                                          preferred_element_type=None)
+                                          feature_group_count=groups)
     if bias is not None:
         output = output + bias.reshape(bias.shape[0], 1)
     return output
