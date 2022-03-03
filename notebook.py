@@ -90,20 +90,20 @@ from torchvision.transforms import functional as TF
 import torch.utils.data
 import torch
 
-import diffusion as v_diffusion
-
 from diffusion_models.common import DiffusionOutput, Partial, make_partial, blur_fft, norm1
-from diffusion_models.cache import WeakCache
+from diffusion_models.lazy import LazyParams
 from diffusion_models.schedules import cosine, ddpm, ddpm2, spliced
-from diffusion_models.perceptor import vit32, vit16, clip_size, normalize
+from diffusion_models.perceptor import get_clip, clip_size, normalize
 
+from diffusion_models.aesthetic import AestheticLoss, AestheticExpected
 from diffusion_models.secondary import secondary1_wrap, secondary2_wrap
-from diffusion_models.antijpeg import jpeg_wrap, jpeg_classifier_wrap
+from diffusion_models.antijpeg import anti_jpeg_cfg, jpeg_classifier
 from diffusion_models.pixelart import pixelartv4_wrap, pixelartv6_wrap
-from diffusion_models.pixelartv7 import pixelartv7_ic_wrap, pixelartv7_ic_attn_wrap
-from diffusion_models.pixelartv7grid import pixelartv7_ic_attn_grid_wrap2
-from diffusion_models.cc12m_1 import cc12m_1_wrap, cc12m_1_cfg_wrap
-from diffusion_models.openai import make_openai_model, make_openai_finetune_model
+from diffusion_models.pixelartv7 import pixelartv7_ic_attn
+from diffusion_models.cc12m_1 import cc12m_1_cfg_wrap, cc12m_1_classifier_wrap
+from diffusion_models.openai import openai_256, openai_512, openai_512_finetune
+from diffusion_models.kat_models import danbooru_128, wikiart_128, wikiart_256, imagenet_128
+from diffusion_models import sampler, adapter
 
 devices = jax.devices()
 n_devices = len(devices)
@@ -139,41 +139,21 @@ def fetch(url_or_path):
 def fetch_model(url_or_path):
     basename = os.path.basename(url_or_path)
     local_path = os.path.join(model_location, basename)
-    if os.path.exists(local_path):
-        return local_path
-    else:
+    if os.path.exists(url_or_path):
+      return url_or_path
+    elif os.path.exists(local_path):
+      return local_path
+    elif url_or_path.startswith('http'):
         os.makedirs(f'{model_location}/tmp', exist_ok=True)
         Popen(['curl', url_or_path, '-o', f'{model_location}/tmp/{basename}']).wait()
         os.rename(f'{model_location}/tmp/{basename}', local_path)
         return local_path
-
-# Implement lazy loading and caching of model parameters for all the different models.
-
-gpu_cache = WeakCache(jnp.array)
-
-def to_gpu(params):
-  """Convert a pytree of params to jax, using cached arrays if they are still alive."""
-  return jax.tree_util.tree_map(lambda x: gpu_cache(x) if type(x) is np.ndarray else x, params)
-
-class LazyParams(object):
-  """Lazily download parameters and load onto gpu. Parameters are kept in cpu memory and only loaded to gpu as long as needed."""
-  def __init__(self, load):
-    self.load = load
-    self.params = None
-  @staticmethod
-  def pt(url, key=None):
-    def load():
-      params = jaxtorch.pt.load(fetch_model(url))
-      if key is not None:
-        return params[key]
-      else:
-        return params
-    return LazyParams(load)
-  def __call__(self):
-    if self.params is None:
-      self.params = jax.tree_util.tree_map(np.array, self.load())
-    return to_gpu(self.params)
-
+    elif url_or_path.startswith('gs://'):
+        os.makedirs(f'{model_location}/tmp', exist_ok=True)
+        Popen(['gsutil', 'cp', url_or_path, f'{model_location}/tmp/{basename}']).wait()
+        os.rename(f'{model_location}/tmp/{basename}', local_path)
+        return local_path
+LazyParams.fetch = fetch_model
 
 def grey(image):
     [*_, c, h, w] = image.shape
@@ -194,59 +174,70 @@ def cutout_image(image, offsetx, offsety, size, output_size=224):
 
 def cutouts_images(image, offsetx, offsety, size, output_size=224):
     f = partial(cutout_image, output_size=output_size)         # [c h w] [] [] [] -> [c h w]
-    f = jax.vmap(f, in_axes=(0, None, None, None), out_axes=0) # [n c h w] [] [] [] -> [n c h w]
-    f = jax.vmap(f, in_axes=(None, 0, 0, 0), out_axes=0)       # [n c h w] [k] [k] [k] -> [k n c h w]
+    f = jax.vmap(f, in_axes=(0, 0, 0, 0), out_axes=0)          # [n c h w] [n] [n] [n] -> [n c h w]
+    f = jax.vmap(f, in_axes=(None, 0, 0, 0), out_axes=0)       # [n c h w] [k n] [k n] [k n] -> [k n c h w]
     return f(image, offsetx, offsety, size)
 
 @jax.tree_util.register_pytree_node_class
 class MakeCutouts(object):
-    def __init__(self, cut_size, cutn, cut_pow=1., p_grey=0.2, p_mixgrey=0.0):
+    def __init__(self, cut_size, cutn, cut_pow=1.0, p_grey=0.2, p_mixgrey=None, p_flip=0.5):
         self.cut_size = cut_size
         self.cutn = cutn
         self.cut_pow = cut_pow
         self.p_grey = p_grey
         self.p_mixgrey = p_mixgrey
+        self.p_flip = p_flip
 
     def __call__(self, input, key):
-        [b, c, h, w] = input.shape
+        [n, c, h, w] = input.shape
         rng = PRNG(key)
+
+        small_cuts = self.cutn//2
+        large_cuts = self.cutn - self.cutn//2
+
         max_size = min(h, w)
         min_size = min(h, w, self.cut_size)
-        cut_us = jax.random.uniform(rng.split(), shape=[self.cutn//2])**self.cut_pow
-        sizes = (min_size + cut_us * (max_size - min_size + 1)).astype(jnp.int32).clamp(min_size, max_size)
-        offsets_x = jax.random.uniform(rng.split(), [self.cutn//2], minval=0, maxval=w - sizes)
-        offsets_y = jax.random.uniform(rng.split(), [self.cutn//2], minval=0, maxval=h - sizes)
+        cut_us = jax.random.uniform(rng.split(), shape=[small_cuts, n])**self.cut_pow
+        sizes = (min_size + cut_us * (max_size - min_size)).clamp(min_size, max_size)
+        offsets_x = jax.random.uniform(rng.split(), [small_cuts, n], minval=0, maxval=w - sizes)
+        offsets_y = jax.random.uniform(rng.split(), [small_cuts, n], minval=0, maxval=h - sizes)
         cutouts = cutouts_images(input, offsets_x, offsets_y, sizes)
 
         B1 = 40
         B2 = 40
-        lcut_us = jax.random.uniform(rng.split(), shape=[self.cutn//2])
+        lcut_us = jax.random.uniform(rng.split(), shape=[large_cuts, n])
         border = B1 + lcut_us * B2
         lsizes = (max(h,w) + border).astype(jnp.int32)
-        loffsets_x = jax.random.uniform(rng.split(), [self.cutn//2], minval=w/2-lsizes/2-border, maxval=w/2-lsizes/2+border)
-        loffsets_y = jax.random.uniform(rng.split(), [self.cutn//2], minval=h/2-lsizes/2-border, maxval=h/2-lsizes/2+border)
+        loffsets_x = jax.random.uniform(rng.split(), [large_cuts, n], minval=w/2-lsizes/2-border, maxval=w/2-lsizes/2+border)
+        loffsets_y = jax.random.uniform(rng.split(), [large_cuts, n], minval=h/2-lsizes/2-border, maxval=h/2-lsizes/2+border)
         lcutouts = cutouts_images(input, loffsets_x, loffsets_y, lsizes)
 
         cutouts = jnp.concatenate([cutouts, lcutouts], axis=0)
 
         greyed = grey(cutouts)
 
-        grey_us = jax.random.uniform(rng.split(), shape=[self.cutn, b, 1, 1, 1])
-        grey_rs = jax.random.uniform(rng.split(), shape=[self.cutn, b, 1, 1, 1])
-        cutouts = jnp.where(grey_us < self.p_mixgrey, grey_rs * greyed + (1 - grey_rs) * cutouts, cutouts)
+        if self.p_mixgrey is not None:
+          grey_us = jax.random.uniform(rng.split(), shape=[self.cutn, n, 1, 1, 1])
+          grey_rs = jax.random.uniform(rng.split(), shape=[self.cutn, n, 1, 1, 1])
+          cutouts = jnp.where(grey_us < self.p_mixgrey, grey_rs * greyed + (1 - grey_rs) * cutouts, cutouts)
 
-        grey_us = jax.random.uniform(rng.split(), shape=[self.cutn, b, 1, 1, 1])
-        cutouts = jnp.where(grey_us < self.p_grey, greyed, cutouts)
+        if self.p_grey is not None:
+          grey_us = jax.random.uniform(rng.split(), shape=[self.cutn, n, 1, 1, 1])
+          cutouts = jnp.where(grey_us < self.p_grey, greyed, cutouts)
+
+        if self.p_flip is not None:
+          flip_us = jax.random.bernoulli(rng.split(), self.p_flip, [self.cutn, n, 1, 1, 1])
+          cutouts = jnp.where(flip_us, jnp.flip(cutouts, axis=-1), cutouts)
+
         return cutouts
 
     def tree_flatten(self):
-        return ([self.p_grey, self.cut_pow, self.p_mixgrey], (self.cut_size, self.cutn))
+        return ([self.cut_pow, self.p_grey, self.p_mixgrey, self.p_flip], (self.cut_size, self.cutn))
 
     @staticmethod
     def tree_unflatten(static, dynamic):
         (cut_size, cutn) = static
-        (p_grey, cut_pow, p_mixgrey) = dynamic
-        return MakeCutouts(cut_size, cutn, cut_pow, p_grey, p_mixgrey)
+        return MakeCutouts(cut_size, cutn, *dynamic)
 
 @jax.tree_util.register_pytree_node_class
 class MakeCutoutsPixelated(object):
@@ -292,7 +283,7 @@ def spherical_dist_loss(x, y):
 class LerpModels(object):
     """Linear combination of diffusion models."""
     def __init__(self, models):
-        self.models = models
+        self.models = [(m, jnp.asarray(w)) for (m,w) in models]
     def __call__(self, x, t, key):
         n = x.shape[0]
         outputs = [(m(x,t,key), w.broadcast_to([n])[:,None,None,None]) for (m,w) in self.models]
@@ -308,8 +299,6 @@ class LerpModels(object):
 @jax.tree_util.register_pytree_node_class
 class KatModel(object):
     def __init__(self, model, params, **kwargs):
-      if isinstance(params, LazyParams):
-        params = params()
       self.model = model
       self.params = params
       self.kwargs = kwargs
@@ -358,16 +347,8 @@ def PanoramaModel(model, x, cosine_t, key):
 
 # Models and parameters
 
-# Secondary Model
-secondary1_params = LazyParams.pt('https://v-diffusion.s3.us-west-2.amazonaws.com/secondary_model_imagenet.pth')
-secondary2_params = LazyParams.pt('https://v-diffusion.s3.us-west-2.amazonaws.com/secondary_model_imagenet_2.pth')
-
-# Anti-JPEG model
-jpeg_params = LazyParams.pt('https://set.zlkj.in/models/diffusion/jpeg-db-oi-614.pt', key='params_ema')
-jpeg_classifier_params = LazyParams.pt('https://set.zlkj.in/models/diffusion/jpeg-classifier-72.pt', 'params_ema')
-
 # Pixel art model
-# There are many checkpoints supported with this model
+# There are many checkpoints supported with this model, so maybe better to provide choice in the notebook
 pixelartv4_params = LazyParams.pt(
     # 'https://set.zlkj.in/models/diffusion/pixelart/pixelart-v4_34.pt'
     # 'https://set.zlkj.in/models/diffusion/pixelart/pixelart-v4_63.pt'
@@ -398,91 +379,10 @@ pixelartv6_params = LazyParams.pt(
     , key='params_ema'
 )
 
-pixelartv7_ic_params = LazyParams.pt(
-    # 'https://set.zlkj.in/models/diffusion/pixelart/pixelart-v6-ic-1400.pt'
-    'https://set.zlkj.in/models/diffusion/pixelart/pixelart-v7-large-ic-700.pt'
-    , key='params_ema'
-)
-
-pixelartv7_ic_attn_params = LazyParams.pt(
-    # 'https://set.zlkj.in/models/diffusion/pixelart/pixelart-v6-ic-1400.pt'
-    'https://set.zlkj.in/models/diffusion/pixelart/pixelart-v7-large-ic-attn-600.pt'
-    , key='params_ema'
-)
-
-pixelartv7_ic_attn_grid_params = LazyParams.pt(
-    # 'https://set.zlkj.in/models/diffusion/pixelart/pixelart-v6-ic-1400.pt'
-    'https://set.zlkj.in/models/diffusion/pixelart/pixelart-v7-large-ic-attn-grid-1000.pt'
-    , key='params_ema'
-)
-
-# Kat models
-
-danbooru_128_model = v_diffusion.get_model('danbooru_128')
-danbooru_128_params = LazyParams(lambda: v_diffusion.load_params(fetch_model('https://v-diffusion.s3.us-west-2.amazonaws.com/danbooru_128.pkl')))
-
-wikiart_256_model = v_diffusion.get_model('wikiart_256')
-wikiart_256_params = LazyParams(lambda: v_diffusion.load_params(fetch_model('https://v-diffusion.s3.us-west-2.amazonaws.com/wikiart_256.pkl')))
-
-wikiart_128_model = v_diffusion.get_model('wikiart_128')
-wikiart_128_params = LazyParams(lambda: v_diffusion.load_params(fetch_model('https://v-diffusion.s3.us-west-2.amazonaws.com/wikiart_128.pkl')))
-
-imagenet_128_model = v_diffusion.get_model('imagenet_128')
-imagenet_128_params = LazyParams(lambda: v_diffusion.load_params(fetch_model('https://v-diffusion.s3.us-west-2.amazonaws.com/imagenet_128.pkl')))
-
-# CC12M_1 model
-
-cc12m_1_params = LazyParams.pt('https://v-diffusion.s3.us-west-2.amazonaws.com/cc12m_1.pth')
-cc12m_1_cfg_params = LazyParams.pt('https://v-diffusion.s3.us-west-2.amazonaws.com/cc12m_1_cfg.pth')
-
-# OpenAI models.
-
-use_checkpoint = False # Set to True to save some memory
-
-openai_512_model = openai.create_openai_512_model(use_checkpoint=use_checkpoint)
-openai_512_params = openai_512_model.init_weights(jax.random.PRNGKey(0))
-openai_512_params = LazyParams.pt('https://set.zlkj.in/models/diffusion/512x512_diffusion_uncond_finetune_008100.pt')
-openai_512_wrap = make_openai_model(openai_512_model)
-
-openai_256_model = openai.create_openai_256_model(use_checkpoint=use_checkpoint)
-openai_256_params = openai_256_model.init_weights(jax.random.PRNGKey(0))
-openai_256_params = LazyParams.pt('https://openaipublic.blob.core.windows.net/diffusion/jul-2021/256x256_diffusion_uncond.pt')
-openai_256_wrap = make_openai_model(openai_256_model)
-
-openai_512_finetune_wrap = make_openai_finetune_model(openai_512_model)
-openai_512_finetune_params = LazyParams.pt('https://set.zlkj.in/models/diffusion/512x512_diffusion_uncond_openimages_epoch28_withfilter.pt')
-
-# Aesthetic Model
-
-def apply_partial(*args, **kwargs):
-  def sub(f):
-    return Partial(f, *args, **kwargs)
-  return sub
-
-aesthetic_model = nn.Linear(512, 10)
-aesthetic_model.init_weights(jax.random.PRNGKey(0))
-aesthetic_model_params = jaxtorch.pt.load(fetch_model('https://v-diffusion.s3.us-west-2.amazonaws.com/ava_vit_b_16_full.pth'))
-
-def exec_aesthetic_model(params, embed):
-  return jax.nn.log_softmax(aesthetic_model(Context(params, None), embed), axis=-1)
-exec_aesthetic_model = Partial(exec_aesthetic_model, aesthetic_model_params)
-
 # Losses and cond fn.
 
-@make_partial
-@apply_partial(exec_aesthetic_model)
-def AestheticLoss(exec_aesthetic_model, target, scale, image_embeds):
-    [k, n, d] = image_embeds.shape
-    log_probs = exec_aesthetic_model(image_embeds)
-    return -(scale * log_probs[:, :, target-1].mean(0)).sum()
-
-@make_partial
-@apply_partial(exec_aesthetic_model)
-def AestheticExpected(exec_aesthetic_model, scale, image_embeds):
-    [k, n, d] = image_embeds.shape
-    probs = jax.nn.softmax(exec_aesthetic_model(image_embeds))
-    expected = (probs * (1 + jnp.arange(10))).sum(-1)
-    return -(scale * expected.mean(0)).sum()
+def filternone(xs):
+  return [x for x in xs if x is not None]
 
 @jax.tree_util.register_pytree_node_class
 class CondCLIP(object):
@@ -491,12 +391,12 @@ class CondCLIP(object):
         self.perceptor = perceptor
         self.make_cutouts = make_cutouts
         self.cut_batches = cut_batches
-        self.losses = losses
+        self.losses = filternone(losses)
     def __call__(self, x_in, key):
         n = x_in.shape[0]
         def main_clip_loss(x_in, key):
             cutouts = normalize(self.make_cutouts(x_in.add(1).div(2), key)).rearrange('k n c h w -> (k n) c h w')
-            image_embeds = self.perceptor.embed_cutouts(cutouts).reshape([self.make_cutouts.cutn, n, 512])
+            image_embeds = self.perceptor.embed_cutouts(cutouts).rearrange('(k n) c -> k n c', n=n)
             return sum(loss_fn(image_embeds) for loss_fn in self.losses)
         num_cuts = self.cut_batches
         keys = jnp.stack(jax.random.split(key, num_cuts))
@@ -596,7 +496,10 @@ class MainCondFn(object):
         self.use = use
 
     @jax.jit
-    def __call__(self, key, x, cosine_t):
+    def __call__(self, x, cosine_t, key):
+        if not self.conditions:
+          return jnp.zeros_like(x)
+
         rng = PRNG(key)
         n = x.shape[0]
 
@@ -632,11 +535,11 @@ class MainCondFn(object):
 class CondFns(object):
     def __init__(self, *conditions):
         self.conditions = conditions
-    def __call__(self, key, x, t):
+    def __call__(self, x, t, key):
         rng = PRNG(key)
         total = jnp.zeros_like(x)
         for cond in self.conditions:
-          total += cond(rng.split(), x, t)
+          total += cond(x, t, key)
         return total
     def tree_flatten(self):
         return [self.conditions], []
@@ -650,53 +553,16 @@ def clamp_score(score):
 
 
 @make_partial
-def BlurRangeLoss(scale, key, x, cosine_t):
+def BlurRangeLoss(scale, x, cosine_t, key):
     def blurred_pred(x, cosine_t):
       alpha, sigma = cosine.to_alpha_sigma(cosine_t)
-      blur_radius = (sigma / alpha * 2).clamp(0.05,512)
+      blur_radius = (sigma / alpha * 2)
       return blur_fft(x, blur_radius) / alpha.clamp(0.01)
     def loss(x):
         pred = blurred_pred(x, cosine_t)
         diff = pred - pred.clamp(minval=-1,maxval=1)
         return diff.square().sum()
     return clamp_score(-scale * jax.grad(loss)(x))
-
-def sample_step(key, x, t1, t2, diffusion, cond_fn, eta):
-    rng = PRNG(key)
-
-    n = x.shape[0]
-    alpha1, sigma1 = cosine.to_alpha_sigma(t1)
-    alpha2, sigma2 = cosine.to_alpha_sigma(t2)
-
-    # Run the model
-    out = diffusion(x, t1, rng.split())
-    eps = out.eps
-    pred0 = out.pred
-
-    # # Predict the denoised image
-    # pred0 = (x - eps * sigma1) / alpha1
-
-    # Adjust eps with conditioning gradient
-    cond_score = cond_fn(rng.split(), x, t1)
-    eps = eps - sigma1 * cond_score
-
-    # Predict the denoised image with conditioning
-    pred = (x - eps * sigma1) / alpha1
-
-    # Negative eta allows more extreme levels of noise.
-    ddpm_sigma = (sigma2**2 / sigma1**2).sqrt() * (1 - alpha1**2 / alpha2**2).sqrt()
-    ddim_sigma = jnp.where(eta >= 0.0,
-                           eta * ddpm_sigma, # Normal: eta interpolates between ddim and ddpm
-                           -eta * sigma2)    # Extreme: eta interpolates between ddim and q_sample(pred)
-    adjusted_sigma = (sigma2**2 - ddim_sigma**2).sqrt()
-
-    # Recombine the predicted noise and predicted denoised image in the
-    # correct proportions for the next step
-    x = pred * alpha2 + eps * adjusted_sigma
-
-    # Add the correct amount of fresh noise
-    x += jax.random.normal(rng.split(), x.shape) * ddim_sigma
-    return x, pred0
 
 def process_prompt(clip, prompt):
   expands = braceexpand(prompt)
@@ -712,26 +578,25 @@ def process_prompt(clip, prompt):
 def process_prompts(clip, prompts):
   return jnp.stack([process_prompt(clip, prompt) for prompt in prompts])
 
-def mkgrid(n, h, w):
-    return jnp.concatenate([
-      jnp.linspace(-1, 1, h)[None,:,None].broadcast_to([n, 1, h, w]),
-      jnp.linspace(-1, 1, w)[None,None,:].broadcast_to([n, 1, h, w])], axis=1)
-
+def expand(xs, batch_size):
+  return (xs * batch_size)[:batch_size]
 
 """Configuration for the run"""
 
-seed = 123 # if None, uses the current time in seconds.
-image_size = (256, 256)
-batch_size = 2
+seed = None # if None, uses the current time in seconds.
+image_size = (320,256)
+batch_size = 4
 n_batches = 1
-use_model = 'pixelartv7_ic_attn_grid'
 
-def expand(xs):
-  return (xs * batch_size)[:batch_size]
+main_model = 'pixelartv6'
+secondary_model = None # None | secondary2
 
-# all_title = 'a cute girl levitating a slice of pizza with her mind #pixelart'
-all_title = 'concept art of a vaporwave rifle by steven belledin #pixelart'
-title = expand([all_title])
+enable_anti_jpeg = False # Useful for openai or cc12m_1_cfg
+clips = ['ViT-B/32', 'ViT-B/16'] # 'ViT-L/14'
+
+
+all_title = '"Memories of what happened leave me little butterflies", by Mili'
+title = expand([all_title], batch_size)
 
 # all_title = 'concept art of the mirror dimension by steven belledin #pixelart'
 # all_title = 'A surreal landscape, where the sky is covered in flowers, the flowers represent the gods and the mountains are the sacred temple. {unreal engine,trending on artstation}'
@@ -741,35 +606,51 @@ title = expand([all_title])
 # title = [all_title] * batch_size
 
 
-grid_guidance_scale = jnp.array(10.0)
+# For cc12m_1_cfg
+cfg_guidance_scale = 12.0
 
-cfg_guidance_scale = 2.0
+# For aesthetic loss, requires ViT-B/16
+aesthetic_loss_scale = 16.0
+
+# For pixelartv7_ic_attn
 ic_cond = 'https://irc.zlkj.in/uploads/eebeaf1803e898ac/88552154_p0%20-%20Coral.png'
+ic_guidance_scale = 2.0
+
+# 'https://set.zlkj.in/data/openimages/validation-512/0a1f4761dc7fe1eb.png'
+# 'https://set.zlkj.in/data/danbooru/val/danbooru2020/512px/0004/1608004.jpg'
+# '/home/em/Downloads/starry_night_full.jpg'
+# 'https://set.zlkj.in/data/danbooru/val/danbooru2020/original/0039/1873039.jpg'
 # 'https://irc.zlkj.in/uploads/eebeaf1803e898ac/88552154_p0%20-%20Coral.png'
 # 'https://cdn.discordapp.com/emojis/916943952597360690.png?size=240&quality=lossless' # pizagal
 
-clip_guidance_scale = jnp.array([4000]*batch_size) # Note: with two perceptors, effective guidance scale is ~2x because they are added together.
+clip_guidance_scale = 2000.0 # Note: with two perceptors, effective guidance scale is ~2x because they are added together.
 tv_scale = 0  # Smooths out the image
 sat_scale = 0 # Tries to prevent pixel values from going out of range
+
 cutn = 8        # Effective cutn is cut_batches * this
-cut_pow = 1.0   # Affects the size of cutouts. Larger cut_pow -> smaller cutouts (down to the min of 224x244)
 cut_batches = 4
-make_cutouts = MakeCutouts(clip_size, cutn, cut_pow=cut_pow, p_mixgrey=0.0)
+cut_pow = 1.0   # Affects the size of cutouts. Larger cut_pow -> smaller cutouts (down to the min of 224x244)
+cut_p_mixgrey = None # 0.5
+cut_p_grey = 0.2
+cut_p_flip = 0.5
+make_cutouts = MakeCutoutsPixelated(MakeCutouts(clip_size, cutn, cut_pow=cut_pow, p_grey=cut_p_grey, p_flip=cut_p_grey, p_mixgrey=cut_p_mixgrey))
+
+# sample_mode:
+#  prk : high quality, 3x slow (eta=0)
+#  plms : high quality, about as fast as ddim (eta=0)
+#  ddim : traditional, accepts eta for different noise levels which sometimes have nice aesthetic effect
+sample_mode = 'ddim'
 
 steps = 250     # Number of steps for sampling. Generally, more = better.
-eta = 1.0       # 0.0: DDIM | 1.0: DDPM | -1.0: Extreme noise (q_sample)
-init_image = None      # Diffusion will start with a mixture of this image with noise.
+eta = 1.0       # Only applies to ddim sample loop: 0.0: DDIM | 1.0: DDPM | -1.0: Extreme noise (q_sample)
 starting_noise = 1.0   # Between 0 and 1. When using init image, generally 0.5-0.8 is good. Lower starting noise makes the result look more like the init.
+ending_noise = 0.0     # Usually 0.0 for high detail. Can set a little higher like 0.05 for smoother looking result.
+
+init_image = None      # Diffusion will start with a mixture of this image with noise.
 init_weight_mse = 0    # MSE loss between the output and the init makes the result look more like the init (should be between 0 and width*height*3).
 
-#'https://paste.zlkj.in/uploads/b2e3e7598c28c91b/stargate.png'
-#'https://paste.zlkj.in/uploads/e735fba6cec734c9/dapper.png'
-#'https://media.discordapp.net/attachments/730484623028519072/918889801502052382/QUSCEEEIIIYQ8QEeBEEIIIYQQ8gAdBUIIIYQQQsgDdBQIIYQQQgghD9BRIIQQQgghhDzwJ2tlUFA46C78AAAAAElFTkSuQmCC.png'
-#'https://media.discordapp.net/attachments/730484623028519072/918841165590179910/unnamed.jpg'
-
-
 # OpenAI used T=1000 to 0. We've just rescaled to between 1 and 0.
-schedule = jnp.linspace(starting_noise, 0, steps+1)
+schedule = jnp.linspace(starting_noise, ending_noise, steps+1)
 schedule = spliced.to_cosine(schedule)
 
 def load_image(url):
@@ -786,96 +667,65 @@ else:
     init_array = None
 
 def config():
-    # Configure models and load parameters onto gpu.
-    # We do this in a function to avoid leaking gpu memory.
-    if use_model == 'openai':
-        # -- Openai with anti-jpeg --
-        openai = openai_512_model_wrap(openai_512_params())
-        secondary2 = secondary2_wrap(secondary2_params())
-        jpeg_0 = jpeg_wrap(jpeg_params(), cond=jnp.array([0]*batch_size)) # Clean class
-        jpeg_1 = jpeg_wrap(jpeg_params(), cond=jnp.array([2]*batch_size)) # Unconditional class
+    vitb32 = lambda: get_clip('ViT-B/32')
+    vitb16 = lambda: get_clip('ViT-B/16')
+    vitl14 = lambda: get_clip('ViT-L/14')
 
-        jpeg_classifier_fn = jpeg_classifier_wrap(jpeg_classifier_params(),
-                                                  guidance_scale=10000.0, # will generally depend on image size
-                                                  flood_level=0.7, # Prevent over-optimization
-                                                  blur_size=3.0)
+    if main_model == 'openai':
+      diffusion = openai_512()
+    elif main_model in ('wikiart_256', 'wikiart_128', 'danbooru_128', 'imagenet_128'):
+      if main_model == 'wikiart_256':
+          diffusion = wikiart_256()
+      elif main_model == 'wikiart_128':
+          diffusion = wikiart_128()
+      elif main_model == 'danbooru_128':
+          diffusion = danbooru_128()
+      elif main_model == 'imagenet_128':
+          diffusion = imagenet_128()
+    elif 'pixelart' in main_model:
+      # -- pixel art model --
+      if main_model == 'pixelartv7_ic_attn':
+          cond = jnp.array(TF.to_tensor(Image.open(fetch(ic_cond)).convert('RGB'))) * 2 - 1
+          cond = jnp.concatenate([cond]*(image_size[1]//cond.shape[-2]+1), axis=-2)[:, :image_size[1], :]
+          cond = jnp.concatenate([cond]*(image_size[0]//cond.shape[-1]+1), axis=-1)[:, :, :image_size[0]]
+          cond = cond.broadcast_to([batch_size, 3, image_size[1], image_size[0]])
+          diffusion = pixelartv7_ic_attn(cond, ic_guidance_scale)
+      elif main_model == 'pixelartv6':
+          diffusion = pixelartv6_wrap(pixelartv6_params())
+      elif main_model == 'pixelartv4':
+          diffusion = pixelartv4_wrap(pixelartv4_params())
+    elif main_model == 'cc12m_1_cfg':
+      diffusion = cc12m_1_cfg_wrap(clip_embed=vitb16().embed_texts(title), cfg_guidance_scale=cfg_guidance_scale)
+    elif main_model == 'openai_finetune':
+        diffusion = openai_512_finetune()
 
-        diffusion = LerpModels([(openai, 1.0),
-                                (jpeg_0, 1.0),
-                                (jpeg_1, -1.0)])
-        cond_model = secondary2
+    if secondary_model == 'secondary2':
+      cond_model = secondary2_wrap()
+    else:
+      cond_model = diffusion
 
-        cond_fn = CondFns(MainCondFn(cond_model, [
-            CondCLIP(vit32, make_cutouts, cut_batches, SphericalDistLoss(process_prompts(vit32, title), clip_guidance_scale)),
-            CondCLIP(vit16, make_cutouts, cut_batches, SphericalDistLoss(process_prompts(vit16, title), clip_guidance_scale)),
-            CondTV(tv_scale) if tv_scale > 0 else None,
-            CondMSE(init_array, init_weight_mse) if init_weight_mse > 0 else None,
-            CondSat(sat_scale) if sat_scale > 0 else None,
-        ]), jpeg_classifier_fn)
+    if enable_anti_jpeg:
+      diffusion = LerpModels([(diffusion, 1.0),
+                              (anti_jpeg_cfg(), 1.0)])
 
-    elif use_model in ('wikiart_256', 'wikiart_128', 'danbooru_128', 'imagenet_128'):
-        if use_model == 'wikiart_256':
-            diffusion = KatModel(wikiart_256_model, wikiart_256_params())
-        elif use_model == 'wikiart_128':
-            diffusion = KatModel(wikiart_128_model, wikiart_128_params())
-        elif use_model == 'danbooru_128':
-            diffusion = KatModel(danbooru_128_model, danbooru_128_params())
-        elif use_model == 'imagenet_128':
-            diffusion = KatModel(imagenet_128_model, imagenet_128_params())
-        cond_model = diffusion
-        cond_fn = MainCondFn(cond_model, [
-                    CondCLIP(vit32, make_cutouts, cut_batches,
-                             SphericalDistLoss(process_prompts(vit32, title), clip_guidance_scale)),
-                    CondCLIP(vit16, make_cutouts, cut_batches,
-                             SphericalDistLoss(process_prompts(vit16, title), clip_guidance_scale)),
-                    CondTV(tv_scale) if tv_scale > 0 else None,
-                    CondMSE(init_array, init_weight_mse) if init_weight_mse > 0 else None,
-                    CondSat(sat_scale) if sat_scale > 0 else None,
-                    ])
+    cond_fn = MainCondFn(cond_model, [
+      CondCLIP(vitb32(), make_cutouts, cut_batches,
+               SphericalDistLoss(process_prompts(vitb32(), title), clip_guidance_scale) if clip_guidance_scale > 0 else None)
+      if 'ViT-B/32' in clips and clip_guidance_scale > 0 else None,
 
-    elif 'pixelart' in use_model:
-        if use_model == 'pixelartv7_ic_attn':
-            # -- pixel art model --
-            cond = jnp.array(TF.to_tensor(Image.open(fetch(ic_cond)).convert('RGB').resize(image_size,Image.BICUBIC))) * 2 - 1
-            cond = cond.broadcast_to([batch_size, 3, image_size[1], image_size[0]])
-            diffusion = pixelartv7_ic_attn_wrap(pixelartv7_ic_attn_params(), cond=cond, cfg_guidance_scale=cfg_guidance_scale)
-        elif use_model == 'pixelartv7_ic_attn_grid':
-            # -- pixel art model --
-            cond = jnp.array(TF.to_tensor(Image.open(fetch(ic_cond)).convert('RGB').resize(image_size,Image.BICUBIC))) * 2 - 1
-            cond = cond.broadcast_to([batch_size, 3, image_size[1], image_size[0]])
-            grid = mkgrid(batch_size, image_size[1], image_size[0])
-            diffusion = LerpModels([(pixelartv7_ic_attn_grid_wrap2(pixelartv7_ic_attn_grid_params(), cond=cond, grid=grid), grid_guidance_scale),
-                                    (pixelartv7_ic_attn_grid_wrap2(pixelartv7_ic_attn_grid_params(), cond=cond, grid=None), 1.0-grid_guidance_scale)])
-        elif use_model == 'pixelartv6':
-            diffusion = pixelartv6_wrap(pixelartv6_params())
-        elif use_model == 'pixelartv4':
-            diffusion = pixelartv4_wrap(pixelartv4_params())
-        cond_model = diffusion
-        cond_fn = MainCondFn(cond_model, [
-            CondCLIP(vit32, MakeCutoutsPixelated(make_cutouts), cut_batches,
-                     SphericalDistLoss(process_prompts(vit32, title), clip_guidance_scale)),
-            CondCLIP(vit16, MakeCutoutsPixelated(make_cutouts), cut_batches,
-                     SphericalDistLoss(process_prompts(vit16, title), clip_guidance_scale)),
-            CondMSE(init_array, init_weight_mse) if init_weight_mse > 0 else None,
-        ])
+      CondCLIP(vitb16(), make_cutouts, cut_batches,
+               SphericalDistLoss(process_prompts(vitb16(), title), clip_guidance_scale) if clip_guidance_scale > 0 else None,
+               AestheticExpected(aesthetic_loss_scale) if aesthetic_loss_scale > 0 else None)
+      if 'ViT-B/16' in clips and (clip_guidance_scale > 0 or aesthetic_loss_scale > 0) else None,
 
-    elif use_model == 'cc12m_1_cfg':
-        diffusion = cc12m_1_cfg_wrap(cc12m_1_cfg_params(), clip_embed=vit16.embed_texts(title), cfg_guidance_scale=5.0)
-        cond_fn = CondFns()
+      CondCLIP(vitl14(), make_cutouts, cut_batches,
+               SphericalDistLoss(process_prompts(vitl14(), title), clip_guidance_scale) if clip_guidance_scale > 0 else None)
+      if 'ViT-L/14' in clips and clip_guidance_scale > 0 else None,
 
-    elif use_model == 'openai_finetune':
-        diffusion = openai_512_finetune_wrap(openai_512_finetune_params())
-        cond_model = secondary2_wrap(secondary2_params())
-        cond_fn = CondFns(MainCondFn(cond_model, [
-                    CondCLIP(vit32, make_cutouts, cut_batches, SphericalDistLoss(process_prompts(vit32, title), clip_guidance_scale)),
-                    CondCLIP(vit16, make_cutouts, cut_batches,
-                              SphericalDistLoss(process_prompts(vit16, title), clip_guidance_scale),
-                              AestheticExpected(jnp.array([16.0,16.0,16.0,16.0]))
-                             ),
-                    CondTV(tv_scale) if tv_scale > 0 else None,
-                    CondMSE(init_array, init_weight_mse) if init_weight_mse > 0 else None,
-                    CondSat(sat_scale) if sat_scale > 0 else None,
-                    ]))
+      CondTV(tv_scale) if tv_scale > 0 else None,
+      CondMSE(init_array, init_weight_mse) if init_weight_mse > 0 else None,
+      CondSat(sat_scale) if sat_scale > 0 else None,
+    ])
 
     return diffusion, cond_fn
 
@@ -908,34 +758,39 @@ def run():
         if init_array is not None:
             x = sigmas[0] * x + alphas[0] * init_array
 
+        grid_width = 2
+
         # Main loop
-        local_steps = schedule.shape[0] - 1
-        for j in tqdm(range(local_steps)):
+        [n, c, h, w] = x.shape
+        if sample_mode == 'ddim':
+          sample_loop = partial(sampler.ddim_sample_loop, eta=eta)
+        elif sample_mode == 'prk':
+          sample_loop = sampler.prk_sample_loop
+        elif sample_mode == 'plms':
+          sample_loop = sampler.plms_sample_loop
+        for output in sampler.ddim_sample_loop(diffusion, cond_fn, x, schedule, rng.split()):
+            j = output['step']
+            pred = output['pred']
             # == Panorama ==
             # shift = jax.random.randint(rng.split(), [batch_size, 2], 0, jnp.array([1, image_size[0]]))
             # x = xyroll(x, shift)
             # == -------- ==
-            if ts[j] == ts[j+1]:
-              continue
-            # Skip steps where the ts are the same, to make it easier to
-            # make complicated schedules out of cat'ing linspaces.
             # diffusion.set(clip_embed=jax.random.normal(rng.split(), [batch_size,512]))
-            x, pred = sample_step(rng.split(), x, ts[j], ts[j+1], diffusion, cond_fn, eta)
             assert x.isfinite().all().item()
-            if j % 50 == 0 or j == local_steps - 1:
+            if j % 10 == 0 or j == steps:
                 images = pred
                 # images = jnp.concatenate([images, x], axis=0)
                 images = images.add(1).div(2).clamp(0, 1)
                 images = torch.tensor(np.array(images))
-                display.display(TF.to_pil_image(utils.make_grid(images, 4).cpu()))
+                TF.to_pil_image(utils.make_grid(images, grid_width).cpu()).save(f'progress_{j:05}.png')
 
         # Save samples
         os.makedirs('samples/grid', exist_ok=True)
         if save_location:
           os.makedirs(f'{save_location}/grid', exist_ok=True)
-        TF.to_pil_image(utils.make_grid(images, 2).cpu()).save(f'samples/grid/{timestring}_{sanitize(all_title)}.png')
+        TF.to_pil_image(utils.make_grid(images, grid_width).cpu()).save(f'samples/grid/{timestring}_{sanitize(all_title)}.png')
         if save_location:
-            TF.to_pil_image(utils.make_grid(images, 2).cpu()).save(f'{save_location}/grid/{timestring}_{sanitize(all_title)}.png')
+            TF.to_pil_image(utils.make_grid(images, grid_width).cpu()).save(f'{save_location}/grid/{timestring}_{sanitize(all_title)}.png')
 
         os.makedirs('samples/images', exist_ok=True)
         if save_location:

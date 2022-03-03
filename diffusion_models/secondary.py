@@ -6,6 +6,7 @@ import jaxtorch
 from jaxtorch import PRNG, Context, Module, nn, init
 
 from diffusion_models.common import *
+from diffusion_models.lazy import LazyParams
 from diffusion_models.schedules import cosine
 
 class ConvBlock(nn.Sequential):
@@ -130,8 +131,10 @@ class SecondaryDiffusionImageNet2(nn.Module):
 
 secondary1_model = SecondaryDiffusionImageNet()
 secondary1_model.labeled_parameters_()
-secondary1_wrap = make_cosine_model(secondary1_model)
+secondary1_params = LazyParams.pt('https://v-diffusion.s3.us-west-2.amazonaws.com/secondary_model_imagenet.pth')
+secondary1_wrap = make_cosine_model(secondary1_model, secondary1_params)
 
 secondary2_model = SecondaryDiffusionImageNet2()
 secondary2_model.labeled_parameters_()
-secondary2_wrap = make_cosine_model(secondary2_model)
+secondary2_params = LazyParams.pt('https://v-diffusion.s3.us-west-2.amazonaws.com/secondary_model_imagenet_2.pth')
+secondary2_wrap = make_cosine_model(secondary2_model, secondary2_params)

@@ -9,6 +9,7 @@ from jaxtorch import PRNG, Context, Module, nn, init
 
 from diffusion_models.common import *
 from diffusion_models.schedules import cosine
+from diffusion_models.lazy import LazyParams
 
 class ResidualBlock(nn.Module):
     def __init__(self, main, skip=None):
@@ -233,19 +234,12 @@ cc12m_1_model = CC12M1Model()
 cc12m_1_model.labeled_parameters_()
 
 cc12m_1_wrap = make_cosine_model(cc12m_1_model)
+cc12m_1_cfg_params = LazyParams.pt('https://v-diffusion.s3.us-west-2.amazonaws.com/cc12m_1_cfg.pth')
 
-@make_partial
-@jax.jit
-def cc12m_1_cfg_wrap(params, x, cosine_t, key, clip_embed=None, cfg_guidance_scale=1.0):
-    [n, c, h, w] = x.shape
-    cx = Context(params, key).eval_mode_()
-    return (cc12m_1_model(cx, x, cosine_t.broadcast_to([n]), clip_embed) * cfg_guidance_scale +
-            cc12m_1_model(cx, x, cosine_t.broadcast_to([n]), 0*clip_embed) * (1.0-cfg_guidance_scale))
+def cc12m_1_cfg_wrap(clip_embed, cfg_guidance_scale):
+    return LerpModels([(cc12m_1_wrap(cc12m_1_cfg_params(), clip_embed=clip_embed), cfg_guidance_scale),
+                       (cc12m_1_wrap(cc12m_1_cfg_params(), clip_embed=0*clip_embed), 1-cfg_guidance_scale)])
 
-@make_partial
-@jax.jit
-def cc12m_1_classifier_wrap(params, x, cosine_t, key, clip_embed=None, cfg_guidance_scale=1.0):
-    [n, c, h, w] = x.shape
-    cx = Context(params, key).eval_mode_()
-    return (cc12m_1_model(cx, x, cosine_t.broadcast_to([n]), clip_embed) * cfg_guidance_scale +
-            cc12m_1_model(cx, x, cosine_t.broadcast_to([n]), 0*clip_embed) * (-cfg_guidance_scale))
+def cc12m_1_classifier_wrap(clip_embed):
+    return LerpModels([(cc12m_1_wrap(cc12m_1_cfg_params(), clip_embed=clip_embed), 1.0),
+                       (cc12m_1_wrap(cc12m_1_cfg_params(), clip_embed=0*clip_embed), -1.0)])

@@ -7,6 +7,7 @@ from jaxtorch import PRNG, Context, Module, nn, init
 
 from diffusion_models.common import *
 from diffusion_models.schedules import cosine
+from diffusion_models.lazy import LazyParams
 
 class ResidualBlock(nn.Module):
     def __init__(self, main, skip=None):
@@ -249,16 +250,32 @@ pixelartv7_ic_attn_model.labeled_parameters_()
 
 @make_partial
 @jax.jit
-def pixelartv7_ic_attn_wrap(params, x, cosine_t, key, cond=None, cfg_guidance_scale=None):
+def pixelartv7_ic_attn_wrap(params, x, cosine_t, key, cond=None, ic_guidance_scale=None):
     [n, c, h, w] = x.shape
     cx = Context(params, key).eval_mode_()
-    if cfg_guidance_scale is not None:
+    if ic_guidance_scale is not None:
+        ic_guidance_scale = ic_guidance_scale.broadcast_to([n])[:,None,None,None]
         cond = jnp.concatenate([cond, jnp.ones([n, 1, h, w])], axis=1)
-        return (pixelartv7_ic_attn_model(cx, x, cosine_t.broadcast_to([n]), cond) * cfg_guidance_scale +
-                pixelartv7_ic_attn_model(cx, x, cosine_t.broadcast_to([n]), 0*cond) * (1.0-cfg_guidance_scale))
+        return (pixelartv7_ic_attn_model(cx, x, cosine_t.broadcast_to([n]), cond) * ic_guidance_scale +
+                pixelartv7_ic_attn_model(cx, x, cosine_t.broadcast_to([n]), 0*cond) * (1.0-ic_guidance_scale))
     elif cond is not None:
         cond = jnp.concatenate([cond, jnp.ones([n, 1, h, w])], axis=1)
         return pixelartv7_ic_attn_model(cx, x, cosine_t.broadcast_to([n]), cond)
     else:
         cond = jnp.zeros([n, 4, h, w])
         return pixelartv7_ic_attn_model(cx, x, cosine_t.broadcast_to([n]), cond)
+
+
+pixelartv7_ic_params = LazyParams.pt(
+    # 'https://set.zlkj.in/models/diffusion/pixelart/pixelart-v6-ic-1400.pt'
+    'https://set.zlkj.in/models/diffusion/pixelart/pixelart-v7-large-ic-700.pt'
+    , key='params_ema'
+)
+
+pixelartv7_ic_attn_params = LazyParams.pt(
+    'https://set.zlkj.in/models/diffusion/pixelart/pixelart-v7-large-ic-attn-600.pt'
+    , key='params_ema'
+)
+
+def pixelartv7_ic_attn(cond, ic_guidance_scale):
+    return pixelartv7_ic_attn_wrap(pixelartv7_ic_attn_params(), cond=cond, ic_guidance_scale=ic_guidance_scale)

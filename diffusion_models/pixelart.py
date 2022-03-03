@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -7,6 +8,7 @@ from jaxtorch import PRNG, Context, Module, nn, init
 
 from diffusion_models.common import *
 from diffusion_models.schedules import cosine
+from diffusion_models.lazy import LazyParams
 
 class ResidualBlock(nn.Module):
     def __init__(self, main, skip=None):

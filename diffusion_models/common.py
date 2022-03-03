@@ -87,19 +87,26 @@ def make_partial(f):
     return Partial(f, *args, **kwargs)
   return p
 
-def make_cosine_model(model):
+def make_cosine_model(model, lazy_params=None):
     @make_partial
     @jax.jit
     def forward(params, x, cosine_t, key, **kwargs):
         n = x.shape[0]
         cx = Context(params, key).eval_mode_()
         return model(cx, x, cosine_t.broadcast_to([n]), **kwargs)
-    return forward
+    if lazy_params is not None:
+        def wrapper(**kwargs):
+            return forward(lazy_params(), **kwargs)
+        return wrapper
+    else:
+        def wrapper(params, **kwargs):
+            return forward(params, **kwargs)
+        return wrapper
 
 @jax.jit
 def blur_fft(image, std):
   std = jnp.asarray(std).clamp(1e-18)
-  [n, c, h, w] = image.shape
+  [*_, h, w] = image.shape
   dy = jnp.arange(-(h-1)//2, (h+1)//2)
   dy = jnp.roll(dy, -(h-1)//2)
   dx = jnp.arange(-(w-1)//2, (w+1)//2)
@@ -119,3 +126,35 @@ def Normalize(mean, std):
 def norm1(x):
     """Normalize to the unit sphere."""
     return x / x.square().sum(axis=-1, keepdims=True).sqrt().clamp(1e-12)
+
+@jax.tree_util.register_pytree_node_class
+class Static(object):
+    def __init__(self, value):
+        self.value = value
+    def __bool__(self):
+        return bool(self.value)
+    def tree_flatten(self):
+        return [], [self.value]
+    @classmethod
+    def tree_unflatten(cls, static, dynamic):
+        return cls(*static)
+
+def expand_batched(array, n):
+    return jnp.asarray(array).broadcast_to([n])[:,None,None,None]
+
+@jax.tree_util.register_pytree_node_class
+class LerpModels(object):
+    """Linear combination of diffusion models."""
+    def __init__(self, models):
+        self.models = models
+    def __call__(self, x, t, key):
+        n = x.shape[0]
+        outputs = [(m(x,t,key), expand_batched(w, n)) for (m,w) in self.models]
+        v = sum(out.v * w for (out, w) in outputs)
+        pred = sum(out.pred * w for (out, w) in outputs)
+        eps = sum(out.eps * w for (out, w) in outputs)
+        return DiffusionOutput(v, pred, eps)
+    def tree_flatten(self):
+        return [self.models], []
+    def tree_unflatten(static, dynamic):
+        return LerpModels(*dynamic)

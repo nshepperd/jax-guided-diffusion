@@ -1,2 +1,4 @@
 CLIP_JAX
 *.png
+models
+v-diffusion-jax

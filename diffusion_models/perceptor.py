@@ -9,6 +9,7 @@ import clip_jax
 
 from diffusion_models.common import *
 from diffusion_models.schedules import cosine
+from diffusion_models.lazy import LazyParams
 
 @jax.tree_util.register_pytree_node_class
 class Perceptor(object):
@@ -41,12 +42,10 @@ clip_size = 224
 normalize = Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
                       std=[0.26862954, 0.26130258, 0.27577711])
 
-image_fn, text_fn, clip_params, preprocess = clip_jax.load('ViT-B/32')
-vit32 = Perceptor(image_fn, text_fn, clip_params, preprocess)
-image_fn, text_fn, clip_params, preprocess = clip_jax.load('ViT-B/16')
-vit16 = Perceptor(image_fn, text_fn, clip_params, preprocess)
-
-def get_vitl14():
-    image_fn, text_fn, clip_params, preprocess = clip_jax.load('ViT-L/14')
-    vitl14 = Perceptor(image_fn, text_fn, clip_params, preprocess)
-    return vitl14
+clip_cache = {}
+def get_clip(model_name):
+    if model_name not in clip_cache:
+        image_fn, text_fn, clip_params, preprocess = clip_jax.load(model_name)
+        clip_params = LazyParams(params=clip_params) # Move to cpu.
+        clip_cache[model_name] = lambda: Perceptor(image_fn, text_fn, clip_params(), preprocess)
+    return clip_cache[model_name]()

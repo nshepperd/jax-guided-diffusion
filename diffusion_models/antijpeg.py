@@ -7,6 +7,7 @@ from jaxtorch import PRNG, Context, Module, nn, init
 
 from diffusion_models.common import *
 from diffusion_models.schedules import cosine
+from diffusion_models.lazy import LazyParams
 
 # Anti-JPEG model
 class ResidualBlock(nn.Module):
@@ -71,6 +72,7 @@ class JPEGModel(nn.Module):
 
     def forward(self, cx, input, ts, cond):
         [n, c, h, w] = input.shape
+        cond = jnp.asarray(cond).broadcast_to([n])
         timestep_embed = expand_to_planes(self.timestep_embed(cx, ts[:, None]), input.shape)
         class_embed = expand_to_planes(self.class_embed(cx, cond), input.shape)
         v = self.net(cx, jnp.concatenate([input, timestep_embed, class_embed], axis=1))
@@ -84,8 +86,12 @@ class JPEGModel(nn.Module):
 
 jpeg_model = JPEGModel()
 jpeg_model.labeled_parameters_()
-jpeg_wrap = make_cosine_model(jpeg_model)
-# jpeg_params = LazyParams.pt('https://set.zlkj.in/models/diffusion/jpeg-db-oi-614.pt', key='params_ema')
+jpeg_params = LazyParams.pt('https://set.zlkj.in/models/diffusion/jpeg-db-oi-614.pt', key='params_ema')
+anti_jpeg = make_cosine_model(jpeg_model, jpeg_params)
+def anti_jpeg_cfg():
+    return LerpModels([(anti_jpeg(cond=0), 1.0), # clean
+                       (anti_jpeg(cond=2), -1.0),# mixed
+                       ])
 
 # Secondary Anti-JPEG Classifier
 
@@ -127,23 +133,28 @@ class Classifier(nn.Module):
         loss = loss.clamp(minval=flood_level, maxval=None)
         return loss.mean()
 
-@jax.jit
-def classifier_probs(classifier_params, x, ts):
-  n = x.shape[0]
-  cx = Context(classifier_params, jax.random.PRNGKey(0)).eval_mode_()
-  probs = jax.nn.sigmoid(classifier_model(cx, x, ts.broadcast_to([n])))
-  return probs
+# @jax.jit
+# def classifier_probs(classifier_params, x, ts):
+#   n = x.shape[0]
+#   cx = Context(classifier_params, jax.random.PRNGKey(0)).eval_mode_()
+#   probs = jax.nn.sigmoid(classifier_model(cx, x, ts.broadcast_to([n])))
+#   return probs
 
 jpeg_classifier_model = Classifier()
 jpeg_classifier_model.labeled_parameters_()
-# classifier_params = classifier_model.init_weights(jax.random.PRNGKey(0))
-# classifier_params = LazyParams.pt('https://set.zlkj.in/models/diffusion/jpeg-classifier-72.pt', 'params_ema')
+jpeg_classifier_params = LazyParams.pt('https://set.zlkj.in/models/diffusion/jpeg-classifier-72.pt', 'params_ema')
 
 @make_partial
-def jpeg_classifier_wrap(params, key, x, cosine_t, guidance_scale, flood_level=0.7, blur_size=3.0):
+@jax.jit
+def jpeg_classifier_wrap(params, x, key, cosine_t, guidance_scale, flood_level=0.7, blur_size=3.0):
     n = x.shape[0]
     cond = jnp.array([0]*n)
     def fwd(x):
         cx = Context(params, key).eval_mode_()
         return guidance_scale * jpeg_classifier_model.score(cx, x, cosine_t.broadcast_to([n]), cond, flood_level, blur_size)
     return -jax.grad(fwd)(x)
+
+def jpeg_classifier(guidance_scale, flood_level=0.7, blur_size=3.0):
+    return jpeg_classifier_wrap(jpeg_classifier_params(),
+                                guidance_scale=guidance_scale,
+                                flood_level=flood_level, blur_size=blur_size)
