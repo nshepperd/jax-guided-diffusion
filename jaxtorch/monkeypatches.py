@@ -30,8 +30,8 @@ def broadcast_to(arr, shape):
   compatible = all(arr_d in (1, shape_d) for (arr_d, shape_d) in zip(arr_shape, shape_tail))
   if nlead < 0 or not compatible:
       raise ValueError(f"Incompatible shapes for broadcasting: {arr_shape} and requested shape {shape}")
-  diff = [i for i, (arr_d, shape_d) in enumerate(zip(arr_shape, shape_tail)) if arr_d != shape_d]
-  kept_dims = [nlead + i for i in range(len(arr_shape)) if i not in diff]
+  diff = tuple(i for i, (arr_d, shape_d) in enumerate(zip(arr_shape, shape_tail)) if arr_d != shape_d)
+  kept_dims = tuple(nlead + i for i in range(len(arr_shape)) if i not in diff)
   return jax.lax.broadcast_in_dim(jnp.squeeze(arr, diff), shape, kept_dims)
 
 register(
