@@ -22,22 +22,17 @@ def register(**kwargs):
 def broadcast_to(arr, shape):
   shape = (shape,) if jnp.ndim(shape) == 0 else shape
   shape = jax.core.canonicalize_shape(shape)  # check that shape is concrete
-  arr_shape = arr.shape
-  if jax.core.symbolic_equal_shape(arr_shape, shape):
-    return arr
-  else:
-    nlead = len(shape) - len(arr_shape)
-    shape_tail = shape[nlead:]
-    compatible = all(jax.core.symbolic_equal_one_of_dim(arr_d, [1, shape_d])
-                      for arr_d, shape_d in zip(arr_shape, shape_tail))
-    if nlead < 0 or not compatible:
-      msg = "Incompatible shapes for broadcasting: {} and requested shape {}"
-      raise ValueError(msg.format(arr_shape, shape))
-    diff, = np.where(tuple(not jax.core.symbolic_equal_dim(arr_d, shape_d)
-                           for arr_d, shape_d in zip(arr_shape, shape_tail)))
-    new_dims = tuple(range(nlead)) + tuple(nlead + diff)
-    kept_dims = tuple(np.delete(np.arange(len(shape)), new_dims))
-    return jax.lax.broadcast_in_dim(jnp.squeeze(arr, tuple(diff)), shape, kept_dims)
+  arr_shape = jax.core.canonicalize_shape(arr.shape)
+  if arr_shape == shape:
+      return arr
+  nlead = len(shape) - len(arr_shape)
+  shape_tail = shape[nlead:]
+  compatible = all(arr_d in (1, shape_d) for (arr_d, shape_d) in zip(arr_shape, shape_tail))
+  if nlead < 0 or not compatible:
+      raise ValueError(f"Incompatible shapes for broadcasting: {arr_shape} and requested shape {shape}")
+  diff = [i for i, (arr_d, shape_d) in enumerate(zip(arr_shape, shape_tail)) if arr_d != shape_d]
+  kept_dims = [nlead + i for i in range(len(arr_shape)) if i not in diff]
+  return jax.lax.broadcast_in_dim(jnp.squeeze(arr, diff), shape, kept_dims)
 
 register(
     square = lambda arr: arr**2,
