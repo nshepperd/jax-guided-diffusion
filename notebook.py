@@ -81,16 +81,13 @@ import jaxtorch
 from jaxtorch import PRNG, Context, Module, nn, init
 from tqdm import tqdm
 
-from lib.script_util import create_model_and_diffusion, model_and_diffusion_defaults
-from lib import util, openai
-
 from IPython import display
 from torchvision import datasets, transforms, utils
 from torchvision.transforms import functional as TF
 import torch.utils.data
 import torch
 
-from diffusion_models.common import DiffusionOutput, Partial, make_partial, blur_fft, norm1
+from diffusion_models.common import DiffusionOutput, Partial, make_partial, blur_fft, norm1, LerpModels
 from diffusion_models.lazy import LazyParams
 from diffusion_models.schedules import cosine, ddpm, ddpm2, spliced
 from diffusion_models.perceptor import get_clip, clip_size, normalize
@@ -279,44 +276,6 @@ def spherical_dist_loss(x, y):
 # handle recompiling the jitted code whenever a control-flow affecting parameter
 # is changed (such as cut_batches).
 
-@jax.tree_util.register_pytree_node_class
-class LerpModels(object):
-    """Linear combination of diffusion models."""
-    def __init__(self, models):
-        self.models = [(m, jnp.asarray(w)) for (m,w) in models]
-    def __call__(self, x, t, key):
-        n = x.shape[0]
-        outputs = [(m(x,t,key), w.broadcast_to([n])[:,None,None,None]) for (m,w) in self.models]
-        v = sum(out.v * w for (out, w) in outputs)
-        pred = sum(out.pred * w for (out, w) in outputs)
-        eps = sum(out.eps * w for (out, w) in outputs)
-        return DiffusionOutput(v, pred, eps)
-    def tree_flatten(self):
-        return [self.models], []
-    def tree_unflatten(static, dynamic):
-        return LerpModels(*dynamic)
-
-@jax.tree_util.register_pytree_node_class
-class KatModel(object):
-    def __init__(self, model, params, **kwargs):
-      self.model = model
-      self.params = params
-      self.kwargs = kwargs
-    @jax.jit
-    def __call__(self, x, cosine_t, key):
-        n = x.shape[0]
-        alpha, sigma = cosine.to_alpha_sigma(cosine_t)
-        v = self.model.apply(self.params, key, x, cosine_t.broadcast_to([n]), self.kwargs)
-        pred = x * alpha - v * sigma
-        eps = x * sigma + v * alpha
-        return DiffusionOutput(v, pred, eps)
-    def tree_flatten(self):
-        return [self.params, self.kwargs], [self.model]
-    def tree_unflatten(static, dynamic):
-        [params, kwargs] = dynamic
-        [model] = static
-        return KatModel(model, params, **kwargs)
-
 # A wrapper that causes the diffusion model to generate tileable images, by
 # randomly shifting the image with wrap around.
 
@@ -452,10 +411,10 @@ def CondTV(tv_scale, x_in, key):
     return tv_grad_512 + tv_grad_256 + tv_grad_128
 
 @make_partial
-def CondSat(sat_scale, x_in, key):
-    def saturation_loss(x_in):
+def CondRange(range_scale, x_in, key):
+    def range_loss(x_in):
         return jnp.abs(x_in - x_in.clamp(minval=-1,maxval=1)).mean()
-    return sat_scale * jax.grad(saturation_loss)(x_in)
+    return range_scale * jax.grad(saturation_loss)(x_in)
 
 @make_partial
 def CondMSE(target, mse_scale, x_in, key):

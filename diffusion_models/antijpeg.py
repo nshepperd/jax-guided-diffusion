@@ -146,7 +146,7 @@ jpeg_classifier_params = LazyParams.pt('https://set.zlkj.in/models/diffusion/jpe
 
 @make_partial
 @jax.jit
-def jpeg_classifier_wrap(params, x, key, cosine_t, guidance_scale, flood_level=0.7, blur_size=3.0):
+def jpeg_classifier_wrap(params, x, cosine_t, key, guidance_scale, flood_level=0.7, blur_size=3.0):
     n = x.shape[0]
     cond = jnp.array([0]*n)
     def fwd(x):
