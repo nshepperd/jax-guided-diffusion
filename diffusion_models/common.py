@@ -24,6 +24,7 @@ class FourierFeatures(nn.Module):
         super().__init__()
         assert out_features % 2 == 0
         self.weight = init.normal(out_features // 2, in_features, stddev=std)
+        self.std = std
 
     def forward(self, cx, input):
         f = 2 * math.pi * input @ cx[self.weight].transpose()

@@ -55,6 +55,27 @@ class DDPM(NoiseSchedule):
     def from_cosine(self, t):
         return cosine_t_to_ddpm(t, self.initial_snr)
 
+@jax.jit
+def reweight_ts(ts, initial_snr=10.0):
+    Z = jax.scipy.special.erfinv(1.0 * jax.scipy.special.erf(jnp.sqrt(initial_snr)))
+    return jax.scipy.special.erfinv(ts * jax.scipy.special.erf(jnp.sqrt(initial_snr)))/Z
+
+@jax.jit
+def inv_reweight_ts(ts, initial_snr=10.0):
+    Z = jnp.sqrt(initial_snr)
+    return jax.scipy.special.erf(ts * Z) / jax.scipy.special.erf(1.0 * Z)
+
+class ReweightedDDPM(NoiseSchedule):
+    def __init__(self, initial_snr=10.0):
+        self.ddpm = DDPM(initial_snr)
+        self.initial_snr = initial_snr
+
+    def to_cosine(self, t):
+        return self.ddpm.to_cosine(reweight_ts(t, self.initial_snr))
+
+    def from_cosine(self, t):
+        return inv_reweight_ts(self.ddpm.from_cosine(t), self.initial_snr)
+
 class LinearLogSnr(NoiseSchedule):
     def __init__(self, initial_snr=10.0, final_snr=-10):
         self.initial_snr = initial_snr
@@ -88,3 +109,4 @@ cosine = Cosine()
 ddpm = DDPM()
 ddpm2 = DDPM(14.0)
 spliced = Spliced()
+reweighted = ReweightedDDPM()
