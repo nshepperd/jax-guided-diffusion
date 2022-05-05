@@ -36,16 +36,16 @@ class KatModel(object):
 
 
 danbooru_128_model = v_diffusion.get_model('danbooru_128')
-danbooru_128_params = LazyParams(lambda: v_diffusion.load_params(LazyParams.fetch('https://v-diffusion.s3.us-west-2.amazonaws.com/danbooru_128.pkl')))
+danbooru_128_params = LazyParams(lambda: v_diffusion.load_params(LazyParams.fetch('https://the-eye.eu/public/AI/models/v-diffusion/danbooru_128.pkl')))
 
 wikiart_256_model = v_diffusion.get_model('wikiart_256')
-wikiart_256_params = LazyParams(lambda: v_diffusion.load_params(LazyParams.fetch('https://v-diffusion.s3.us-west-2.amazonaws.com/wikiart_256.pkl')))
+wikiart_256_params = LazyParams(lambda: v_diffusion.load_params(LazyParams.fetch('https://the-eye.eu/public/AI/models/v-diffusion/wikiart_256.pkl')))
 
 wikiart_128_model = v_diffusion.get_model('wikiart_128')
-wikiart_128_params = LazyParams(lambda: v_diffusion.load_params(LazyParams.fetch('https://v-diffusion.s3.us-west-2.amazonaws.com/wikiart_128.pkl')))
+wikiart_128_params = LazyParams(lambda: v_diffusion.load_params(LazyParams.fetch('https://the-eye.eu/public/AI/models/v-diffusion/wikiart_128.pkl')))
 
 imagenet_128_model = v_diffusion.get_model('imagenet_128')
-imagenet_128_params = LazyParams(lambda: v_diffusion.load_params(LazyParams.fetch('https://v-diffusion.s3.us-west-2.amazonaws.com/imagenet_128.pkl')))
+imagenet_128_params = LazyParams(lambda: v_diffusion.load_params(LazyParams.fetch('https://the-eye.eu/public/AI/models/v-diffusion/imagenet_128.pkl')))
 
 def danbooru_128():
     return KatModel(danbooru_128_model, danbooru_128_params())

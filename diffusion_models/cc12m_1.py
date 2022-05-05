@@ -234,7 +234,7 @@ cc12m_1_model = CC12M1Model()
 cc12m_1_model.labeled_parameters_()
 
 cc12m_1_wrap = make_cosine_model(cc12m_1_model)
-cc12m_1_cfg_params = LazyParams.pt('https://v-diffusion.s3.us-west-2.amazonaws.com/cc12m_1_cfg.pth')
+cc12m_1_cfg_params = LazyParams.pt('https://the-eye.eu/public/AI/models/v-diffusion/cc12m_1_cfg.pth')
 
 def cc12m_1_cfg_wrap(clip_embed, cfg_guidance_scale):
     return LerpModels([(cc12m_1_wrap(cc12m_1_cfg_params(), clip_embed=clip_embed), cfg_guidance_scale),

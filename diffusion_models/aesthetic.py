@@ -11,7 +11,7 @@ from diffusion_models.schedules import cosine, ddpm
 
 aesthetic_model = nn.Linear(512, 10)
 aesthetic_model.labeled_parameters_()
-aesthetic_model_params = LazyParams.pt('https://v-diffusion.s3.us-west-2.amazonaws.com/ava_vit_b_16_full.pth')
+aesthetic_model_params = LazyParams.pt('https://the-eye.eu/public/AI/models/v-diffusion/ava_vit_b_16_full.pth')
 
 def exec_aesthetic_model(params, embed):
   return jax.nn.log_softmax(aesthetic_model(Context(params, None), embed), axis=-1)
