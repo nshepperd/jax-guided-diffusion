@@ -96,6 +96,9 @@ class Tanh(Module):
     def forward(self, cx, x):
         return jnp.tanh(x)
 
+class SiLU(Module):
+    def forward(self, cx, x):
+        return jax.nn.silu(x)
 
 class Dropout(Module):
     def __init__(self, p=0.5):

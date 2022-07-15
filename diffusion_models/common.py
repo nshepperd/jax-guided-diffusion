@@ -18,16 +18,39 @@ class SkipBlock(nn.Module):
     def forward(self, cx, input):
         return jnp.concatenate([self.main(cx, input), self.skip(cx, input)], axis=1)
 
-
-class FourierFeatures(nn.Module):
-    def __init__(self, in_features, out_features, std=1.):
+class ResidualBlock(nn.Module):
+    def __init__(self, main, skip=None):
         super().__init__()
-        assert out_features % 2 == 0
-        self.weight = init.normal(out_features // 2, in_features, stddev=std)
-        self.std = std
+        self.main = nn.Sequential(*main)
+        self.skip = skip if skip else nn.Identity()
 
     def forward(self, cx, input):
-        f = 2 * math.pi * input @ cx[self.weight].transpose()
+        return self.main(cx, input) + self.skip(cx, input)
+
+class Bypass(nn.Module):
+    def __init__(self, f):
+        super().__init__()
+        self.f = f
+        self.a = init.zeros()
+
+    def aval(self, params):
+        return jnp.tanh(params[self.a.name]) + 1
+
+    def forward(self, cx, x):
+        a = jnp.tanh(cx[self.a]) + 1
+        return x * (1 - a) + self.f(cx, x) * a
+
+class FourierFeatures(nn.Module):
+    def __init__(self, in_features, out_features, std=1., renormalized=False):
+        super().__init__()
+        assert out_features % 2 == 0
+        self.weight = init.normal(out_features // 2, in_features, stddev=1.0 if renormalized else std)
+        self.std = std
+        self.renormalized = renormalized
+
+    def forward(self, cx, input):
+        weight = cx[self.weight] * (self.std if self.renormalized else 1.0)
+        f = 2 * math.pi * input @ weight.transpose()
         return jnp.concatenate([f.cos(), f.sin()], axis=-1)
 
 
